@@ -15,6 +15,14 @@ dist-ssr
 # Rust / Tauri 构建产物
 src-tauri/target
 
+# 生成的构建配置（tauri dev/build 时由 CLI 生成）
+src-tauri/gen/schemas
+
+# 本地环境变量
+.env
+.env.*
+!.env.example
+
 # 本地代理配置（不提交）
 .npmrc
 

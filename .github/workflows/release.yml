@@ -1,0 +1,54 @@
+name: Release
+
+# 打 tag（如 v0.1.0）推送后，构建 Windows 安装包并创建 Release 草稿。
+# 也可在 Actions 页面手动触发，仅构建产物不发布。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不写 version：由 package.json 的 packageManager 字段决定（两者同时指定会报错）
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # tauri-action 会自动跑 beforeBuildCommand（pnpm build），无需单独构建前端。
+      # --bundles nsis：tauri.conf.json 里的 targets 含 macOS 专用的 app/dmg，这里只出 Windows 安装包。
+      - name: 构建并发布
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: "SeatPlan ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
+          releaseBody: "下载下方的 `.exe` 安装包，双击安装即可。"
+          releaseDraft: true
+          prerelease: false
+          args: --bundles nsis
