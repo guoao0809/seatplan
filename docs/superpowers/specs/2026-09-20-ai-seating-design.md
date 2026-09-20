@@ -50,19 +50,23 @@
 
 ## 技术选型
 
-### 网络请求：`tauri-plugin-http`
+### 网络请求：Rust 侧 `reqwest`（照搬 gitreport 的 `ai.rs`）
 
-Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截——多数模型厂商不返回 CORS 头。`tauri-plugin-http` 的 `fetch` 经 Rust 发出，绕过 CORS。
+Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截，所以请求必须走 Rust。
 
-备选是在 `lib.rs` 用 `reqwest` 手写命令，代码更多且没有额外收益，故不采用。
+`D:\wok\worknotes\gitreport` 已在同一网关上跑通这套写法，直接复用其既有实现，不重新发明：
 
-需新增：
-- `src-tauri/Cargo.toml` → `tauri-plugin-http = "2"`
-- `package.json` → `@tauri-apps/plugin-http`
-- `lib.rs` → `.plugin(tauri_plugin_http::init())`
-- `src-tauri/capabilities/default.json` → 允许向用户配置的域名发请求
+| 从 gitreport `ai.rs` 取用 | 说明 |
+|---|---|
+| `normalize_base()` / `request_url()` | baseUrl 不以 `/v1` 或 `/chat/completions` 结尾则自动补 `/v1`，再拼 `/chat/completions` |
+| `post_json()` | blocking POST，`Authorization: Bearer`，HTTP 错误透传 status + body 前 200 字符 |
+| `extract_text()` | 取 `choices[0].message.content` |
 
-> 实施时需核对 capability 权限的确切写法（`http:default` 的 scope 如何覆盖动态 baseUrl），以实现时的插件文档为准。
+**不取用**：Anthropic 分支、模型列表候选探测（`KNOWN_COMPAT_SUFFIXES` 那一整套）、流式输出。本项目只走 OpenAI 协议、只需一个端点。
+
+需新增 `src-tauri/Cargo.toml` → `reqwest = { version = "0.12", features = ["json", "blocking"] }`。
+
+> 早先考虑的 `tauri-plugin-http` **不采用**：它需要配 capability 的 URL scope，而用户填的 baseUrl 域名是任意的。走 Rust 命令则完全绕开这个权限问题——整套不确定性消失。
 
 ### 配置文件
 
@@ -91,8 +95,8 @@ Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截——多数
 
 ### 该网关的两个特征
 
-- **明文 HTTP**：`http://`，非 HTTPS。API Key 以明文经网络传输。内网网关通常可接受，但需在 capability 里放行 `http://` 协议——只放行 `https://` 会直接请求失败。这是上文标记「实施时核对」的那处不确定点的具体形态。
-- **无 `/v1` 前缀**：见上，由 `baseUrl` 承载。
+- **明文 HTTP**：`http://`，非 HTTPS，API Key 明文经网络传输。内网网关，可接受。走 Rust 命令后**不涉及任何权限配置**，无需为此做额外放行。
+- **无 `/v1` 前缀**：`normalize_base()` 会自动补，所以配置里写 `http://ai.medical-deep.com:20248` 或带 `/v1` 均可。
 
 ## 提示词与校验
 
@@ -137,10 +141,9 @@ Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截——多数
 | 文件 | 改动 |
 |---|---|
 | `src/lib/ai.ts` | **新增**：拼 payload、构造提示词、解析与校验返回、`runAiSelfCheck()` |
-| `src-tauri/src/lib.rs` | 新增 `load_ai_config` 命令；注册 http 插件 |
-| `src-tauri/Cargo.toml` | 加 `tauri-plugin-http` |
-| `src-tauri/capabilities/default.json` | 加 http 权限 |
-| `package.json` | 加 `@tauri-apps/plugin-http` |
+| `src-tauri/src/ai.rs` | **新增**：URL 拼接、`post_json`、`extract_text`、`ai_arrange` 命令（移植自 gitreport） |
+| `src-tauri/src/lib.rs` | 新增 `load_ai_config` 命令；注册 `ai_arrange` |
+| `src-tauri/Cargo.toml` | 加 `reqwest`（json + blocking） |
 | `src/views/SeatView.vue` | 工具条按钮 + 两个弹窗 + 应用逻辑 |
 
 ## 错误处理
