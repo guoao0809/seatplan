@@ -1,0 +1,155 @@
+//! AI 排座接口调用（OpenAI 兼容协议）。
+//! URL 拼接与请求实现移植自 D:\wok\worknotes\gitreport\src-tauri\src\ai.rs。
+
+// ai_arrange 要到 Task 2 才注册进 invoke_handler，此前整模块都会被 dead_code 判死；注册后本属性可删。
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+const TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Base URL 智能拼接：去掉尾部 '/'；不以 /v1 或 /chat/completions 结尾则补 /v1。
+fn normalize_base(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/v1") || base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
+/// 构造 chat completions 请求 URL
+fn request_url(base_url: &str) -> String {
+    let base = normalize_base(base_url);
+    if base.ends_with("/chat/completions") {
+        base
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
+/// 发 JSON POST，返回响应文本（HTTP 错误透传 status + body 前 200 字符）
+fn post_json(url: &str, config: &AiConfig, body: &Value) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))?;
+
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .json(body)
+        .send()
+        .map_err(|e| format!("网络请求失败：{e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().map_err(|e| format!("读取响应失败：{e}"))?;
+    if !status.is_success() {
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("AI 接口返回错误（HTTP {status}）：{snippet}"));
+    }
+    Ok(text)
+}
+
+/// 从响应 JSON 取 choices[0].message.content
+fn extract_text(body: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("响应不是有效 JSON：{e}"))?;
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            format!(
+                "响应中未找到文本（choices[0].message.content）：{}",
+                body.chars().take(200).collect::<String>()
+            )
+        })
+}
+
+/// 调 AI 排座，返回模型输出的原始文本（解析与校验交给前端）
+#[tauri::command]
+pub fn ai_arrange(config: AiConfig, system: String, user: String) -> Result<String, String> {
+    if config.base_url.trim().is_empty() {
+        return Err("配置里的 baseUrl 为空".into());
+    }
+    if config.api_key.trim().is_empty() {
+        return Err("配置里的 apiKey 为空".into());
+    }
+    if config.model.trim().is_empty() {
+        return Err("配置里的 model 为空".into());
+    }
+
+    let url = request_url(&config.base_url);
+    let body = json!({
+        "model": config.model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "temperature": config.temperature.unwrap_or(0.7),
+        "stream": false
+    });
+
+    let text = post_json(&url, &config, &body)?;
+    extract_text(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_appends_v1_when_missing() {
+        assert_eq!(
+            normalize_base("http://ai.medical-deep.com:20248"),
+            "http://ai.medical-deep.com:20248/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_existing_v1_and_trims_slash() {
+        assert_eq!(
+            normalize_base("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_full_path() {
+        let u = "https://x.com/v1/chat/completions";
+        assert_eq!(normalize_base(u), u);
+    }
+
+    #[test]
+    fn request_url_appends_chat_completions() {
+        assert_eq!(
+            request_url("http://ai.medical-deep.com:20248"),
+            "http://ai.medical-deep.com:20248/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn request_url_keeps_full_path() {
+        let u = "https://x.com/v1/chat/completions";
+        assert_eq!(request_url(u), u);
+    }
+
+    #[test]
+    fn config_temperature_is_optional() {
+        let c: AiConfig =
+            serde_json::from_str(r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m"}"#).unwrap();
+        assert_eq!(c.model, "m");
+        assert!(c.temperature.is_none());
+    }
+}

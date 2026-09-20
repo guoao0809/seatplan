@@ -1,5 +1,7 @@
 //! Tauri 应用入口：最小壳 + 保存座位图命令。
 
+mod ai;
+
 /// 把前端传来的 PNG 字节写入用户指定的路径（std::fs，绕开 fs 插件权限作用域）。
 #[tauri::command]
 fn save_png(path: String, data: Vec<u8>) -> Result<(), String> {
