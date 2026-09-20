@@ -68,21 +68,31 @@ Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截——多数
 
 不写设置界面，用户手写 `config.json`。Rust 侧新增命令 `load_ai_config`，按序查找：
 
-1. exe 同目录（绿色版 / 开发时）
-2. `%APPDATA%\com.seatplan.app\config.json`（安装版；安装到 Program Files 时同目录不可写）
+1. `src-tauri/config.json` —— **仅开发期**（`#[cfg(debug_assertions)]`，即 `CARGO_MANIFEST_DIR`）。`target/` 会被 `cargo clean` 清掉，所以不放 exe 同目录
+2. exe 同目录（绿色版 / 便携版）
+3. `%APPDATA%\com.seatplan.app\config.json`（安装版；装到 Program Files 时 exe 同目录不可写）
 
 格式：
 
 ```json
 {
-  "baseUrl": "https://api.deepseek.com/v1",
+  "baseUrl": "http://ai.medical-deep.com:20248/v1",
   "apiKey": "sk-xxx",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-pro",
   "temperature": 0.7
 }
 ```
 
+`baseUrl` **写到 `/v1` 为止**，代码拼接 `/chat/completions`——这是 OpenAI 兼容接口的通用约定（DeepSeek、通义、智谱、Kimi、OpenAI 一致）。
+
 程序**只读不写**。UI 上显示实际命中哪个文件；找不到则提示去创建。
+
+**安全**：`config.json` 含明文 API Key，已在 `.gitignore` 中（`config.json` 为无路径模式，覆盖任意层级）。已用 `git check-ignore` 验证不会被提交。
+
+### 该网关的两个特征
+
+- **明文 HTTP**：`http://`，非 HTTPS。API Key 以明文经网络传输。内网网关通常可接受，但需在 capability 里放行 `http://` 协议——只放行 `https://` 会直接请求失败。这是上文标记「实施时核对」的那处不确定点的具体形态。
+- **无 `/v1` 前缀**：见上，由 `baseUrl` 承载。
 
 ## 提示词与校验
 
