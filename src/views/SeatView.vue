@@ -287,6 +287,8 @@ async function runAi() {
   const grid = currentGrid();
   const { system, user } = buildMessages({
     grid,
+    // 组名按屏幕显示顺序带上：开了「组号反向」时 seatGrid[0] 的标签不是「第一组」
+    labels: seatGrid.value.map((g) => g.label),
     singleSeatName: singleSeatName.value,
     history: loadRecords()
       .slice(0, 2)

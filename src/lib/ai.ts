@@ -7,7 +7,7 @@ export interface AiConfig {
   apiKey: string;
   model: string;
   temperature?: number;
-  /** 推理强度：不填默认 none（关掉思考，实测 53s→7s）；"off" 表示完全不发该参数 */
+  /** 推理强度。不填用模型默认（推荐）；填 "none" 快但实测会静默排错，慎用 */
   reasoningEffort?: string;
 }
 
@@ -26,6 +26,8 @@ export interface ChatMessage {
 export interface ArrangeInput {
   /** 当前网格：组 → 排 → 座 → 姓名或 null */
   grid: (string | null)[][][];
+  /** 与 grid 一一对应的组名（用户屏幕上看到的，可能因「组号反向」而与下标顺序不同） */
+  labels: string[];
   /** 单座学生姓名（不参与网格排座，仅作上下文） */
   singleSeatName: string;
   /** 最近几次历史网格（最新在前） */
@@ -57,12 +59,15 @@ const SYSTEM_PROMPT = [
   "",
   "硬性规则：",
   "1. 只返回 JSON，不要任何解释文字，不要 markdown 代码块围栏。",
-  "2. grid 的维度必须与 current 完全一致：组数、每组排数、每排座位数都不能变。",
-  "3. 只能使用 roster 中出现的姓名，一个不多一个不少；不允许改名、不允许编造姓名。",
-  "4. 空座位保持为 null。",
-  "5. roster 中位于 singleSeat 的姓名不要放进 grid。",
-  "6. reason 只说思路（谁换到了哪一类位置、为什么这样更公平），不要复述整张座位表。",
-  "7. 用户追问时，基于你上一条给出的座位表继续调整，仍然返回完整网格。",
+  "2. current[i] 与 groups[i] 一一对应。用户说「第 N 组」时，指的是 groups 里那个叫「第 N 组」的项，",
+  "   不要按数组下标去猜——groups 的顺序就是用户屏幕上从左到右看到的顺序。",
+  "3. grid 的维度必须与 current 完全一致：组数、每组排数、每排座位数一个都不能变。",
+  "   每组排数见 shape.rows（按 groups 顺序一一对应），返回前请逐组核对。",
+  "4. 只能使用 roster 中出现的姓名，一个不多一个不少；不允许改名、不允许编造姓名。",
+  "5. 空座位保持为 null。",
+  "6. roster 中位于 singleSeat 的姓名不要放进 grid。",
+  "7. reason 只说思路（谁换到了哪一类位置、为什么这样更公平），不要复述整张座位表。",
+  "8. 用户追问时，基于你上一条给出的座位表继续调整，仍然返回完整网格。",
 ].join("\n");
 
 /** 构造首轮的 system + user 消息 */
@@ -71,6 +76,7 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
   const payload = {
     instruction: input.instruction,
     shape: { rows: input.rows, seatsPerRow: input.seatsPerRow },
+    groups: input.labels,
     singleSeat: input.singleSeatName || null,
     roster: input.singleSeatName ? [...inGrid, input.singleSeatName] : inGrid,
     current: input.grid,
@@ -391,6 +397,7 @@ export function runAiSelfCheck(): void {
     ];
     const { user } = buildMessages({
       grid,
+      labels: ["第一组", "第二组"],
       singleSeatName: "庚",
       history: [],
       instruction: "换个坐法",
@@ -400,6 +407,8 @@ export function runAiSelfCheck(): void {
     const payload = JSON.parse(user) as {
       roster: string[];
       current: (string | null)[][][];
+      groups: string[];
+      shape: { rows: number[]; seatsPerRow: number };
     };
     const wantRoster = [...flattenNames(grid), "庚"];
     if (JSON.stringify(payload.roster) !== JSON.stringify(wantRoster))
@@ -408,6 +417,11 @@ export function runAiSelfCheck(): void {
       );
     if (JSON.stringify(payload.current) !== JSON.stringify(grid))
       throw new Error("buildMessages 的 current 应与输入网格一致");
+    // 组名必须原样带上：用户屏幕上的「第 N 组」与数组下标可能不同序
+    if (JSON.stringify(payload.groups) !== JSON.stringify(["第一组", "第二组"]))
+      throw new Error(`buildMessages 的 groups 应原样透传，实际：${JSON.stringify(payload.groups)}`);
+    if (JSON.stringify(payload.shape.rows) !== JSON.stringify([2, 2]))
+      throw new Error("buildMessages 的 shape.rows 应与输入排数一致");
     // 该 roster 正是 parseArrangement 期待的名单（expectedNames 取网格名）
     const okRes = parseArrangement(
       JSON.stringify({ reason: "r", grid }),
