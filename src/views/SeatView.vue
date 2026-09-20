@@ -9,6 +9,8 @@ import {
   ArrowUpDown,
   Presentation,
   GraduationCap,
+  Sparkles,
+  LoaderCircle,
 } from "lucide-vue-next";
 import { toPng } from "html-to-image";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -25,6 +27,15 @@ import {
   type Group,
 } from "../lib/seat";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
+import {
+  loadAiConfig,
+  arrangeSeats,
+  buildMessages,
+  parseArrangement,
+  flattenNames,
+  runAiSelfCheck,
+  type AiConfig,
+} from "../lib/ai";
 import { showToast } from "../components/toast";
 
 const props = defineProps<{ restore: RestorePayload | null }>();
@@ -46,6 +57,24 @@ const teacherView = ref(false);
 // 弹窗开关（名单 / 配置）
 const showRoster = ref(false);
 const showConfig = ref(false);
+
+// AI 排座
+const showAi = ref(false);
+const aiPrompt = ref("根据上一次排的座位，自动左右调整，保证每个孩子都公平");
+const aiBusy = ref(false);
+const aiError = ref("");
+const aiConfigPath = ref("");
+const aiConfig = ref<AiConfig | null>(null);
+const aiPreview = ref<(string | null)[][][] | null>(null);
+
+const aiPreviewNames = computed(() =>
+  aiPreview.value ? flattenNames(aiPreview.value).length : 0,
+);
+
+/** 当前网格的纯数据快照（组 → 排 → 座 → 姓名或 null） */
+function currentGrid(): (string | null)[][][] {
+  return seatGrid.value.map((g) => g.rows.map((r) => r.seats.map((s) => s.name)));
+}
 
 const nameCount = computed(() => parseRoster(rosterText.value).length);
 const rows = computed(() => parseRows(rowsText.value));
@@ -168,6 +197,78 @@ function toggleReverseGroups() {
   showToast(reverseGroups.value ? "组号已从左往右数" : "组号已从右往左数", "success");
 }
 
+/** 打开 AI 弹窗并读取配置 */
+async function openAi() {
+  aiError.value = "";
+  aiPreview.value = null;
+  aiConfigPath.value = "";
+  aiConfig.value = null;
+  showAi.value = true;
+  try {
+    const loaded = await loadAiConfig();
+    aiConfig.value = loaded.config;
+    aiConfigPath.value = loaded.path;
+  } catch (e) {
+    aiError.value = String(e);
+  }
+}
+
+function closeAi() {
+  if (aiBusy.value) return;
+  showAi.value = false;
+  aiPreview.value = null;
+  aiError.value = "";
+}
+
+/** 发送给 AI，校验返回；通过则进入预览态 */
+async function runAi() {
+  const cfg = aiConfig.value;
+  if (!cfg) {
+    aiError.value = "配置未加载，请检查 config.json";
+    return;
+  }
+  aiBusy.value = true;
+  aiError.value = "";
+  try {
+    const grid = currentGrid();
+    const messages = buildMessages({
+      grid,
+      singleSeatName: singleSeatName.value,
+      history: loadRecords()
+        .slice(0, 2)
+        .map((r) => r.grid),
+      instruction: aiPrompt.value.trim(),
+      rows: rows.value,
+      seatsPerRow: seatCount.value,
+    });
+    const text = await arrangeSeats(cfg, messages.system, messages.user);
+    const res = parseArrangement(text, rows.value, seatCount.value, flattenNames(grid));
+    if (!res.ok) {
+      aiError.value = `校验未通过：${res.reason}\n\n模型原始返回：\n${text}`;
+      return;
+    }
+    aiPreview.value = res.grid;
+  } catch (e) {
+    aiError.value = String(e);
+  } finally {
+    aiBusy.value = false;
+  }
+}
+
+/** 把预览结果写入座位图并持久化 */
+function applyAi() {
+  const g = aiPreview.value;
+  if (!g) return;
+  seatGrid.value = g.map((rowsArr, gi) => ({
+    label: groupLabel(gi, g.length, reverseGroups.value),
+    rows: rowsArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
+  }));
+  persistGrid();
+  showAi.value = false;
+  aiPreview.value = null;
+  showToast("已应用 AI 排座结果", "success");
+}
+
 /** 切换学生/老师视角：老师视角下讲台在学生后方（正下方） */
 function setView(teacher: boolean) {
   if (teacherView.value === teacher) return;
@@ -253,7 +354,10 @@ watch([rosterText, rows, seatCount], () => {
 });
 
 onMounted(() => {
-  if (import.meta.env.DEV) runSelfCheck();
+  if (import.meta.env.DEV) {
+    runSelfCheck();
+    runAiSelfCheck();
+  }
   const saved = localStorage.getItem(LS_ROSTER);
   if (saved != null) rosterText.value = saved;
   const cfg = localStorage.getItem(LS_CFG);
@@ -353,6 +457,13 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
       >
         <Download :size="14" />
         导出图片
+      </button>
+      <button
+        class="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+        @click="openAi"
+      >
+        <Sparkles :size="14" />
+        AI 排座
       </button>
       <span class="ml-auto text-xs text-muted"
         >共 {{ groupCount }} 组 / {{ nameCount }} 人 / 容量 {{ capacity }} 座</span
@@ -544,6 +655,116 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
           >
             完成
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI 排座弹窗：输入态 → 预览态 → 应用 -->
+    <div
+      v-if="showAi"
+      class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
+      @click.self="closeAi"
+    >
+      <div class="flex max-h-[88vh] w-[min(92vw,1040px)] flex-col rounded-xl bg-panel shadow-2xl">
+        <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
+          <span class="text-sm font-medium text-title">
+            {{ aiPreview ? "AI 排座结果预览" : "AI 排座" }}
+          </span>
+          <button
+            class="rounded p-1 text-muted hover:bg-surface hover:text-title"
+            @click="closeAi"
+          >
+            <X :size="16" />
+          </button>
+        </div>
+
+        <!-- 输入态 -->
+        <div v-if="!aiPreview" class="flex min-h-0 flex-col gap-3 overflow-y-auto p-5">
+          <textarea
+            v-model="aiPrompt"
+            rows="5"
+            placeholder="描述你想要的排座方式…"
+            class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
+          ></textarea>
+          <div class="flex items-center gap-2 text-xs text-muted">
+            <template v-if="aiConfigPath">配置文件：{{ aiConfigPath }}</template>
+            <template v-else>正在读取配置…</template>
+            <button
+              class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary"
+              @click="openAi"
+            >
+              重新读取
+            </button>
+          </div>
+          <div
+            v-if="aiError"
+            class="max-h-56 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
+          >
+            {{ aiError }}
+          </div>
+        </div>
+
+        <!-- 预览态 -->
+        <div v-else class="min-h-0 flex-1 overflow-auto p-5">
+          <div class="flex items-start gap-6">
+            <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
+              <div class="text-xs font-medium text-muted">
+                {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
+              </div>
+              <div class="flex flex-col gap-1.5">
+                <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
+                  <div
+                    v-for="(name, si) in row"
+                    :key="si"
+                    class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
+                    :class="
+                      name
+                        ? 'bg-[#86C166] text-white'
+                        : 'bg-surface border border-dashed border-border text-muted'
+                    "
+                  >
+                    {{ name || "—" }}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="mt-4 text-xs text-muted">
+            共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 border-t border-border px-5 py-3">
+          <template v-if="!aiPreview">
+            <button
+              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              @click="closeAi"
+            >
+              取消
+            </button>
+            <button
+              class="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90 disabled:opacity-50"
+              :disabled="aiBusy || !aiPrompt.trim()"
+              @click="runAi"
+            >
+              <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
+              {{ aiBusy ? "排座中…" : "开始排座" }}
+            </button>
+          </template>
+          <template v-else>
+            <button
+              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              @click="aiPreview = null"
+            >
+              返回修改
+            </button>
+            <button
+              class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
+              @click="applyAi"
+            >
+              应用到座位图
+            </button>
+          </template>
         </div>
       </div>
     </div>
