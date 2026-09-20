@@ -65,11 +65,12 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
 
 ## AI 排座配置
 
-「AI 排座」需要一个 OpenAI 兼容接口。在下列任一位置放一个 `config.json`（程序只读，不会改写）：
+「AI 排座」需要一个 OpenAI 兼容接口。配置按下列顺序查找，**用第一个找到的**（程序只读，不会改写）：
 
 1. **开发期**：`src-tauri/config.json`
-2. **便携版**：与 `seatplan.exe` 同目录
-3. **安装版**：`%APPDATA%\com.seatplan.app\config.json`
+2. **exe 同目录**：`config.json`
+3. **用户目录**：`%APPDATA%\com.seatplan.app\config.json`
+4. **安装包内置**：打包时若 `src-tauri/config.json` 存在，其内容会被编进二进制作为兜底
 
 ```json
 {
@@ -87,6 +88,15 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
 - 该文件已被 `.gitignore` 忽略（含明文密钥，**不要提交**）
 
 找不到或格式错误时，AI 弹窗会直接显示实际查找过的路径。
+
+### 内置配置与分发（注意）
+
+打包时若 `src-tauri/config.json` 存在，它会被**编进二进制**作为兜底，装完即用、无需用户配置。这意味着：
+
+- **CI 构建的安装包不含密钥**——`config.json` 被 gitignore，CI 里没有这个文件，编进去的是空串。所以公开 Release 是安全的。
+- **带密钥的安装包只应私下分发**。密钥能从二进制里被提取（解压安装包或 `strings` exe 即可），**不要**把本地构建的带密钥安装包上传到公开 Release。
+
+给别人用又不方便让对方配置时，两个办法：私下发你本地构建的安装包，或者替对方在 `%APPDATA%\com.seatplan.app\config.json` 放一份。
 
 ## 下载
 

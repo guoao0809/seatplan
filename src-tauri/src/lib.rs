@@ -19,8 +19,19 @@ fn save_png(path: String, data: Vec<u8>) -> Result<(), String> {
     std::fs::write(&path, &data).map_err(|e| e.to_string())
 }
 
+/// 构建时由 build.rs 从 config.json 生成；文件不存在（如 CI 构建）时为空串。
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/embedded_config.rs"));
+}
+
+/// 解析一段 JSON 配置；失败时给出带来源的报错
+fn parse_config(text: &str, source: &str) -> Result<AiConfig, String> {
+    serde_json::from_str(text).map_err(|e| format!("{source} 不是合法 JSON：{e}"))
+}
+
 /// 按序查找 config.json：开发期源码目录 → exe 同目录 → AppData。
-/// 只读不写；找不到时把所有查找过的路径一并报出，便于用户放置。
+/// 都找不到时回退到构建时编进二进制的配置（本地打包版会把 config.json 编进去，
+/// CI 打包版不含，故公开安装包不会带密钥）。
 #[tauri::command]
 fn load_ai_config(app: tauri::AppHandle) -> Result<LoadedAiConfig, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -44,20 +55,24 @@ fn load_ai_config(app: tauri::AppHandle) -> Result<LoadedAiConfig, String> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let path = candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or_else(|| format!("未找到 config.json，已查找：\n{searched}"))?;
+    // 文件优先：用户放一份就能覆盖内置配置，不必重新打包
+    if let Some(path) = candidates.into_iter().find(|p| p.is_file()) {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        return Ok(LoadedAiConfig {
+            config: parse_config(&text, &path.display().to_string())?,
+            path: path.display().to_string(),
+        });
+    }
 
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
-    let config: AiConfig = serde_json::from_str(&text)
-        .map_err(|e| format!("{} 不是合法 JSON：{e}", path.display()))?;
+    if !embedded::EMBEDDED_CONFIG.trim().is_empty() {
+        return Ok(LoadedAiConfig {
+            config: parse_config(embedded::EMBEDDED_CONFIG, "内置配置")?,
+            path: "（安装包内置）".into(),
+        });
+    }
 
-    Ok(LoadedAiConfig {
-        config,
-        path: path.display().to_string(),
-    })
+    Err(format!("未找到 config.json，已查找：\n{searched}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
