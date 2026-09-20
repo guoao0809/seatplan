@@ -392,7 +392,17 @@ async function exportImage() {
     return;
   }
   try {
-    const dataUrl = await toPng(node, { pixelRatio: 2, backgroundColor: "#ffffff" });
+    // 只截这张卡片本身。两个坑：
+    // 1. scrollWidth 而非默认的 clientWidth——元素盒子被容器夹住时 clientWidth 偏小；
+    // 2. margin 清零——克隆节点会带上 mx-auto 算出的实际外边距（apply-style 只覆盖
+    //    options.style，不清 margin），导致内容在画布上整体右移、右侧被裁掉。
+    const dataUrl = await toPng(node, {
+      pixelRatio: 2,
+      backgroundColor: "#ffffff",
+      width: node.scrollWidth,
+      height: node.scrollHeight,
+      style: { margin: "0" },
+    });
     // 文件名带 5 位随机数，避免同一天多次导出时重名
     const rand5 = Math.floor(Math.random() * 90000) + 10000;
     // 系统「另存为」对话框：让用户选本地路径
