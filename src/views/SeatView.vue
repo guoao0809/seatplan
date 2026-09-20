@@ -393,10 +393,12 @@ async function exportImage() {
   }
   try {
     const dataUrl = await toPng(node, { pixelRatio: 2, backgroundColor: "#ffffff" });
+    // 文件名带 5 位随机数，避免同一天多次导出时重名
+    const rand5 = Math.floor(Math.random() * 90000) + 10000;
     // 系统「另存为」对话框：让用户选本地路径
     const path = await save({
       title: "保存座位图",
-      defaultPath: `座位图-${new Date().toISOString().slice(0, 10)}.png`,
+      defaultPath: `座位图-${new Date().toISOString().slice(0, 10)}-${rand5}.png`,
       filters: [{ name: "PNG 图片", extensions: ["png"] }],
     });
     if (!path) return; // 用户取消
