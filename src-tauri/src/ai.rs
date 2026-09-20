@@ -19,6 +19,13 @@ pub struct AiConfig {
     pub temperature: Option<f64>,
 }
 
+/// 一条对话消息。字段名本就是单词小写，无需 rename。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 /// Base URL 智能拼接：去掉尾部 '/'；不以 /v1 或 /chat/completions 结尾则补 /v1。
 fn normalize_base(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
@@ -80,7 +87,7 @@ fn extract_text(body: &str) -> Result<String, String> {
 /// async + spawn_blocking：Tauri 2 非 async 命令跑在主线程，阻塞式 reqwest 会冻住 UI，
 /// 因此把整个阻塞过程丢到线程池执行。
 #[tauri::command]
-pub async fn ai_arrange(config: AiConfig, system: String, user: String) -> Result<String, String> {
+pub async fn ai_arrange(config: AiConfig, messages: Vec<ChatMessage>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if config.base_url.trim().is_empty() {
             return Err("配置里的 baseUrl 为空".into());
@@ -91,14 +98,14 @@ pub async fn ai_arrange(config: AiConfig, system: String, user: String) -> Resul
         if config.model.trim().is_empty() {
             return Err("配置里的 model 为空".into());
         }
+        if messages.is_empty() {
+            return Err("消息为空".into());
+        }
 
         let url = request_url(&config.base_url);
         let body = json!({
             "model": config.model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user }
-            ],
+            "messages": messages,
             "temperature": config.temperature.unwrap_or(0.7),
             "stream": false
         });

@@ -33,8 +33,10 @@ import {
   buildMessages,
   parseArrangement,
   flattenNames,
+  appendFollowUp,
   runAiSelfCheck,
   type AiConfig,
+  type ChatMessage,
 } from "../lib/ai";
 import { showToast } from "../components/toast";
 
@@ -65,11 +67,20 @@ const aiBusy = ref(false);
 // 单调递增的请求 id：closeAi 时 bump 作废在途请求，替代「弹窗是否还开着」这个不可靠代理
 let aiReqId = 0;
 const aiError = ref("");
-const aiConfigPath = ref("");
-// 配置读取状态：loading=读取中 ok=已载入 fail=读取失败（失败时 aiConfigPath 为空，需单独区分）
+// 配置读取状态：loading=读取中 ok=已载入 fail=读取失败（失败时错误详情在下方红框里）
 const aiConfigStatus = ref<"loading" | "ok" | "fail">("loading");
 const aiConfig = ref<AiConfig | null>(null);
 const aiPreview = ref<(string | null)[][][] | null>(null);
+/** 模型给出的「为什么这么排」 */
+const aiReason = ref("");
+/** 追问输入框 */
+const aiFollowUp = ref("");
+/** 本轮对话（首轮 system+user，追问依次追加 assistant+user） */
+const aiMessages = ref<ChatMessage[]>([]);
+/** 上一轮模型原始返回，追问时作为 assistant 消息回灌 */
+const aiLastRaw = ref("");
+/** 首次排座时锁定的名单，追问期间不变 */
+const aiExpected = ref<string[]>([]);
 
 const aiPreviewNames = computed(() =>
   aiPreview.value ? flattenNames(aiPreview.value).length : 0,
@@ -204,15 +215,13 @@ function toggleReverseGroups() {
 /** 打开 AI 弹窗并读取配置 */
 async function openAi() {
   aiError.value = "";
-  aiPreview.value = null;
-  aiConfigPath.value = "";
+  resetAiRun();
   aiConfigStatus.value = "loading";
   aiConfig.value = null;
   showAi.value = true;
   try {
     const loaded = await loadAiConfig();
     aiConfig.value = loaded.config;
-    aiConfigPath.value = loaded.path;
     aiConfigStatus.value = "ok";
   } catch (e) {
     aiConfigStatus.value = "fail";
@@ -224,51 +233,89 @@ function closeAi() {
   aiReqId++; // 作废在途请求：其结果/错误不再回写
   aiBusy.value = false; // 工具条立即恢复可用
   showAi.value = false;
-  aiPreview.value = null;
-  aiError.value = "";
+  resetAiRun();
 }
 
-/** 发送给 AI，校验返回；通过则进入预览态 */
-async function runAi() {
-  if (aiBusy.value) return; // 重入保险：防止未来新增触发点导致并发请求
-  if (nameCount.value === 0) {
-    aiError.value = "没有学生，无法排座";
-    return;
-  }
+/** 清空一次排座的全部中间状态（预览、理由、对话、追问框） */
+function resetAiRun() {
+  aiPreview.value = null;
+  aiReason.value = "";
+  aiError.value = "";
+  aiFollowUp.value = "";
+  aiMessages.value = [];
+  aiLastRaw.value = "";
+}
+
+/** 发一次请求并校验；成功则更新预览与理由。msgs 为本轮完整对话。 */
+async function callAi(msgs: ChatMessage[], expected: string[]): Promise<void> {
   const cfg = aiConfig.value;
-  if (!cfg) {
-    aiError.value = "配置未加载，请检查 config.json";
-    return;
-  }
+  if (!cfg) return;
   const id = ++aiReqId;
   aiBusy.value = true;
   aiError.value = "";
   try {
-    const grid = currentGrid();
-    const messages = buildMessages({
-      grid,
-      singleSeatName: singleSeatName.value,
-      history: loadRecords()
-        .slice(0, 2)
-        .map((r) => r.grid),
-      instruction: aiPrompt.value.trim(),
-      rows: rows.value,
-      seatsPerRow: seatCount.value,
-    });
-    const text = await arrangeSeats(cfg, messages.system, messages.user);
+    const text = await arrangeSeats(cfg, msgs);
     if (id !== aiReqId) return; // 请求已被 closeAi 作废：丢弃迟到结果，不动 aiBusy
-    const res = parseArrangement(text, rows.value, seatCount.value, flattenNames(grid));
+    const res = parseArrangement(text, rows.value, seatCount.value, expected);
     if (!res.ok) {
-      aiError.value = `校验未通过：${res.reason}\n\n模型原始返回：\n${text}`;
+      aiError.value = `校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
       return;
     }
+    aiMessages.value = msgs;
+    aiLastRaw.value = text;
     aiPreview.value = res.grid;
+    aiReason.value = res.reason;
   } catch (e) {
     if (id !== aiReqId) return; // 已作废的迟到错误不回写
     aiError.value = String(e);
   } finally {
     if (id === aiReqId) aiBusy.value = false; // 只清自己的请求，别清后来者的
   }
+}
+
+/** 首次排座：用当前座位图与提示词开一轮新对话 */
+async function runAi() {
+  if (aiBusy.value) return; // 重入保险：防止未来新增触发点导致并发请求
+  if (nameCount.value === 0) {
+    aiError.value = "没有学生，无法排座";
+    return;
+  }
+  if (!aiConfig.value) {
+    aiError.value = "配置未加载，请检查 config.json";
+    return;
+  }
+  const grid = currentGrid();
+  const { system, user } = buildMessages({
+    grid,
+    singleSeatName: singleSeatName.value,
+    history: loadRecords()
+      .slice(0, 2)
+      .map((r) => r.grid),
+    instruction: aiPrompt.value.trim(),
+    rows: rows.value,
+    seatsPerRow: seatCount.value,
+  });
+  // 名单以本轮网格为准，追问期间保持不变
+  aiExpected.value = flattenNames(grid);
+  await callAi(
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    aiExpected.value,
+  );
+}
+
+/** 追问：把上一轮模型原文与本轮要求接进对话，重新排 */
+async function runFollowUp() {
+  if (aiBusy.value) return;
+  const text = aiFollowUp.value.trim();
+  if (!text || !aiLastRaw.value) return;
+  await callAi(
+    appendFollowUp(aiMessages.value, aiLastRaw.value, text),
+    aiExpected.value,
+  );
+  if (!aiError.value) aiFollowUp.value = "";
 }
 
 /** 把预览结果写入座位图并持久化 */
@@ -281,7 +328,7 @@ function applyAi() {
   }));
   persistGrid();
   showAi.value = false;
-  aiPreview.value = null;
+  resetAiRun();
   showToast("已应用 AI 排座结果", "success");
 }
 
@@ -681,7 +728,7 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
       @click.self="closeAi"
     >
-      <div class="flex max-h-[88vh] w-[min(92vw,1040px)] flex-col rounded-xl bg-panel shadow-2xl">
+      <div class="flex max-h-[88vh] w-[94vw] max-w-280 flex-col rounded-xl bg-panel shadow-2xl">
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">
             {{ aiPreview ? "AI 排座结果预览" : "AI 排座" }}
@@ -703,9 +750,8 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
           ></textarea>
           <div class="flex items-center gap-2 text-xs text-muted">
-            <template v-if="aiConfigStatus === 'ok'">配置文件：{{ aiConfigPath }}</template>
-            <template v-else-if="aiConfigStatus === 'fail'">配置读取失败（见下方错误）</template>
-            <template v-else>正在读取配置…</template>
+            <template v-if="aiConfigStatus === 'fail'">配置读取失败，见下方错误</template>
+            <template v-else-if="aiConfigStatus === 'loading'">正在读取配置…</template>
             <button
               class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border disabled:hover:text-current"
               :disabled="aiBusy"
@@ -722,35 +768,70 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
           </div>
         </div>
 
-        <!-- 预览态：老师视角下与主座位图一致，整块旋转 180°（标签与座位转回正立） -->
-        <div v-else class="min-h-0 flex-1 overflow-auto p-5">
-          <div class="flex items-start gap-6" :class="teacherView ? 'rotate-180' : ''">
-            <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
-              <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
-                {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
-              </div>
-              <div class="flex flex-col gap-1.5">
-                <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
-                  <div
-                    v-for="(name, si) in row"
-                    :key="si"
-                    class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
-                    :class="[
-                      name
-                        ? 'bg-[#86C166] text-white'
-                        : 'bg-surface border border-dashed border-border text-muted',
-                      teacherView ? 'rotate-180' : '',
-                    ]"
-                  >
-                    {{ name || "—" }}
+        <!-- 预览态：左座位图（老师视角下与主图一致整块旋转），右「为什么这么排」 -->
+        <div v-else class="flex min-h-0 flex-1 gap-5 overflow-hidden p-5">
+          <div class="min-w-0 shrink-0 overflow-auto">
+            <div class="flex items-start gap-6" :class="teacherView ? 'rotate-180' : ''">
+              <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
+                <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
+                  {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
+                </div>
+                <div class="flex flex-col gap-1.5">
+                  <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
+                    <div
+                      v-for="(name, si) in row"
+                      :key="si"
+                      class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
+                      :class="[
+                        name
+                          ? 'bg-[#86C166] text-white'
+                          : 'bg-surface border border-dashed border-border text-muted',
+                        teacherView ? 'rotate-180' : '',
+                      ]"
+                    >
+                      {{ name || "—" }}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
+            <div class="mt-4 text-xs text-muted">
+              共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）
+            </div>
           </div>
-          <div class="mt-4 text-xs text-muted">
-            共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）
+
+          <div class="flex min-w-0 flex-1 flex-col gap-2 border-l border-border pl-5">
+            <div class="text-xs font-medium text-title">为什么这么排</div>
+            <div
+              class="min-h-0 flex-1 overflow-y-auto rounded-lg bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
+            >
+              {{ aiReason || "（模型未给出说明）" }}
+            </div>
+            <div
+              v-if="aiError"
+              class="max-h-40 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
+            >
+              {{ aiError }}
+            </div>
           </div>
+        </div>
+
+        <!-- 追问：接着上一轮继续提要求并重排 -->
+        <div v-if="aiPreview" class="flex shrink-0 items-end gap-2 border-t border-border px-5 py-3">
+          <textarea
+            v-model="aiFollowUp"
+            rows="2"
+            placeholder="不满意？继续提要求后点重排，例如：第三组后排的同学换到前排"
+            class="h-16 min-w-0 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
+          ></textarea>
+          <button
+            class="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90 disabled:opacity-50"
+            :disabled="aiBusy || !aiFollowUp.trim()"
+            @click="runFollowUp"
+          >
+            <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
+            {{ aiBusy ? "重排中…" : "重排" }}
+          </button>
         </div>
 
         <div class="flex justify-end gap-2 border-t border-border px-5 py-3">
@@ -773,11 +854,10 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
           <template v-else>
             <button
               class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
-              @click="aiPreview = null"
+              @click="resetAiRun"
             >
               返回修改
-            </button>
-            <button
+            </button>            <button
               class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
               @click="applyAi"
             >
