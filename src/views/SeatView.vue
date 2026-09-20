@@ -37,6 +37,7 @@ import {
   runAiSelfCheck,
   type AiConfig,
   type ChatMessage,
+  type Grid,
 } from "../lib/ai";
 import { showToast } from "../components/toast";
 
@@ -73,14 +74,14 @@ const aiConfig = ref<AiConfig | null>(null);
 const aiPreview = ref<(string | null)[][][] | null>(null);
 /** 模型给出的「为什么这么排」 */
 const aiReason = ref("");
+/** 模型给出的操作翻成人话，供用户核对（如「交换 第四组第7排第1座 与 …」） */
+const aiSummary = ref("");
 /** 追问输入框 */
 const aiFollowUp = ref("");
 /** 本轮对话（首轮 system+user，追问依次追加 assistant+user） */
 const aiMessages = ref<ChatMessage[]>([]);
 /** 上一轮模型原始返回，追问时作为 assistant 消息回灌 */
 const aiLastRaw = ref("");
-/** 首次排座时锁定的名单，追问期间不变 */
-const aiExpected = ref<string[]>([]);
 
 const aiPreviewNames = computed(() =>
   aiPreview.value ? flattenNames(aiPreview.value).length : 0,
@@ -240,14 +241,15 @@ function closeAi() {
 function resetAiRun() {
   aiPreview.value = null;
   aiReason.value = "";
+  aiSummary.value = "";
   aiError.value = "";
   aiFollowUp.value = "";
   aiMessages.value = [];
   aiLastRaw.value = "";
 }
 
-/** 发一次请求并校验；成功则更新预览与理由。msgs 为本轮完整对话。 */
-async function callAi(msgs: ChatMessage[], expected: string[]): Promise<void> {
+/** 发一次请求并执行模型给出的操作。msgs 为本轮完整对话，baseGrid 为本轮操作的基准网格。 */
+async function callAi(msgs: ChatMessage[], baseGrid: Grid, labels: string[]): Promise<void> {
   const cfg = aiConfig.value;
   if (!cfg) return;
   const id = ++aiReqId;
@@ -256,7 +258,7 @@ async function callAi(msgs: ChatMessage[], expected: string[]): Promise<void> {
   try {
     const text = await arrangeSeats(cfg, msgs);
     if (id !== aiReqId) return; // 请求已被 closeAi 作废：丢弃迟到结果，不动 aiBusy
-    const res = parseArrangement(text, rows.value, seatCount.value, expected);
+    const res = parseArrangement(text, baseGrid, labels);
     if (!res.ok) {
       aiError.value = `校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
       return;
@@ -265,12 +267,18 @@ async function callAi(msgs: ChatMessage[], expected: string[]): Promise<void> {
     aiLastRaw.value = text;
     aiPreview.value = res.grid;
     aiReason.value = res.reason;
+    aiSummary.value = res.summary;
   } catch (e) {
     if (id !== aiReqId) return; // 已作废的迟到错误不回写
     aiError.value = String(e);
   } finally {
     if (id === aiReqId) aiBusy.value = false; // 只清自己的请求，别清后来者的
   }
+}
+
+/** 组名按屏幕显示顺序取——开了「组号反向」时 seatGrid[0] 的标签不是「第一组」 */
+function currentLabels(): string[] {
+  return seatGrid.value.map((g) => g.label);
 }
 
 /** 首次排座：用当前座位图与提示词开一轮新对话 */
@@ -285,38 +293,41 @@ async function runAi() {
     return;
   }
   const grid = currentGrid();
+  const labels = currentLabels();
   const { system, user } = buildMessages({
     grid,
-    // 组名按屏幕显示顺序带上：开了「组号反向」时 seatGrid[0] 的标签不是「第一组」
-    labels: seatGrid.value.map((g) => g.label),
+    labels,
     singleSeatName: singleSeatName.value,
     history: loadRecords()
       .slice(0, 2)
       .map((r) => r.grid),
     instruction: aiPrompt.value.trim(),
-    rows: rows.value,
-    seatsPerRow: seatCount.value,
   });
-  // 名单以本轮网格为准，追问期间保持不变
-  aiExpected.value = flattenNames(grid);
   await callAi(
     [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    aiExpected.value,
+    grid,
+    labels,
   );
 }
 
-/** 追问：把上一轮模型原文与本轮要求接进对话，重新排 */
+/** 追问：以「当前预览」为基准重建 payload（模型才知道现在的状态），再接进对话 */
 async function runFollowUp() {
   if (aiBusy.value) return;
   const text = aiFollowUp.value.trim();
-  if (!text || !aiLastRaw.value) return;
-  await callAi(
-    appendFollowUp(aiMessages.value, aiLastRaw.value, text),
-    aiExpected.value,
-  );
+  const baseGrid = aiPreview.value;
+  if (!text || !aiLastRaw.value || !baseGrid) return;
+  const labels = currentLabels();
+  const { user } = buildMessages({
+    grid: baseGrid,
+    labels,
+    singleSeatName: singleSeatName.value,
+    history: [],
+    instruction: text,
+  });
+  await callAi(appendFollowUp(aiMessages.value, aiLastRaw.value, user), baseGrid, labels);
   if (!aiError.value) aiFollowUp.value = "";
 }
 
@@ -807,6 +818,12 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
           </div>
 
           <div class="flex min-w-0 flex-1 flex-col gap-2 border-l border-border pl-5">
+            <div class="text-xs font-medium text-title">将执行的操作</div>
+            <div
+              class="shrink-0 rounded-lg border border-border bg-panel p-2.5 text-xs leading-relaxed text-text"
+            >
+              {{ aiSummary || "（无）" }}
+            </div>
             <div class="text-xs font-medium text-title">为什么这么排</div>
             <div
               class="min-h-0 flex-1 overflow-y-auto rounded-lg bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
@@ -815,7 +832,7 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             </div>
             <div
               v-if="aiError"
-              class="max-h-40 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
+              class="max-h-40 shrink-0 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
             >
               {{ aiError }}
             </div>

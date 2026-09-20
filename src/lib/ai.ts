@@ -1,4 +1,9 @@
-// AI 排座：拼提示词、解析并校验模型返回的座位表。
+// AI 排座：拼提示词、解析并执行模型给出的排座操作。
+//
+// 关键设计：模型**不输出座位表**，只输出对当前座位表的操作（交换/轮转），由本文件执行。
+// 这样「抄错姓名」「数错每组排数」「自述做了其实没做」三类错误在结构上不可能发生——
+// 姓名与维度根本不经过模型的手。代价是模型只能表达这套操作能覆盖的调整。
+//
 // 本文件不含任何静态 import，可独立自检：node --experimental-strip-types src/lib/ai.ts
 
 /** config.json 的内容（OpenAI 兼容） */
@@ -7,7 +12,7 @@ export interface AiConfig {
   apiKey: string;
   model: string;
   temperature?: number;
-  /** 推理强度。不填用模型默认（推荐）；填 "none" 快但实测会静默排错，慎用 */
+  /** 推理强度。不填默认 "none"（关掉思考，快）；"off" 表示不发该参数走模型默认 */
   reasoningEffort?: string;
 }
 
@@ -23,51 +28,74 @@ export interface ChatMessage {
   content: string;
 }
 
+/** 座位表：组 → 排 → 座 → 姓名或 null */
+export type Grid = (string | null)[][][];
+
+/** 组、排、座 三级下标 */
+type SeatRef = [number, number, number];
+/** 组、排 两级下标 */
+type RowRef = [number, number];
+
+/** 模型可下达的操作 */
+export type SeatOp =
+  | { op: "swapSeats"; a: SeatRef; b: SeatRef }
+  | { op: "swapRows"; a: RowRef; b: RowRef }
+  | { op: "rotateLR" }
+  | { op: "rotateRows"; group: number | null; by: number };
+
 export interface ArrangeInput {
-  /** 当前网格：组 → 排 → 座 → 姓名或 null */
-  grid: (string | null)[][][];
+  /** 当前网格 */
+  grid: Grid;
   /** 与 grid 一一对应的组名（用户屏幕上看到的，可能因「组号反向」而与下标顺序不同） */
   labels: string[];
   /** 单座学生姓名（不参与网格排座，仅作上下文） */
   singleSeatName: string;
   /** 最近几次历史网格（最新在前） */
-  history: (string | null)[][][][];
+  history: Grid[];
   /** 用户的自然语言要求 */
   instruction: string;
-  /** 每组排数 */
-  rows: number[];
-  /** 每排座位数 */
-  seatsPerRow: number;
 }
 
 export type ParseResult =
-  | { ok: true; grid: (string | null)[][][]; reason: string }
+  | { ok: true; grid: Grid; reason: string; ops: SeatOp[]; summary: string }
   | { ok: false; error: string };
 
 /** 展平网格，取出所有非空姓名 */
-export function flattenNames(grid: (string | null)[][][]): string[] {
+export function flattenNames(grid: Grid): string[] {
   const out: string[] = [];
   for (const g of grid) for (const r of g) for (const n of r) if (n) out.push(n);
   return out;
 }
 
+/** 各组排数 */
+export function rowCounts(grid: Grid): number[] {
+  return grid.map((g) => g.length);
+}
+
 const SYSTEM_PROMPT = [
-  "你是教室排座助手。用户给你当前座位表和排座要求，你返回调整后的座位表。",
+  "你是教室排座助手。用户给你当前座位表 current 和一句排座要求，",
+  "你返回**调整操作**，由程序替你执行。你不需要、也不允许输出座位表本身。",
   "",
   "返回格式（严格遵守，就这一个 JSON 对象）：",
-  '{"reason":"用一两句中文说明你这样调整的理由","grid":[[["姓名","姓名"],["姓名","姓名"]]]}',
+  '{"reason":"用一两句中文说明你这样调整的理由","ops":[操作1,操作2,...]}',
+  "",
+  "可用操作（ops 数组内按顺序执行）：",
+  '1. {"op":"swapSeats","a":[组,排,座],"b":[组,排,座]}   交换两个座位上的学生',
+  '2. {"op":"swapRows","a":[组,排],"b":[组,排]}          两排整排对调（两排座位数须相同）',
+  '3. {"op":"rotateLR"}                                  每组每排的座位左右对调',
+  '4. {"op":"rotateRows","group":组号,"by":位移}         组内排整体前后轮转；by 为正向后移、负向前移；group 传 null 表示所有组',
+  "",
+  "坐标一律用**数组下标**（从 0 开始），分别指 current 的第几组、第几排、第几个座。",
+  "groups[i] 是第 i 组在用户屏幕上显示的名字。",
   "",
   "硬性规则：",
-  "1. 只返回 JSON，不要任何解释文字，不要 markdown 代码块围栏。",
-  "2. current[i] 与 groups[i] 一一对应。用户说「第 N 组」时，指的是 groups 里那个叫「第 N 组」的项，",
-  "   不要按数组下标去猜——groups 的顺序就是用户屏幕上从左到右看到的顺序。",
-  "3. grid 的维度必须与 current 完全一致：组数、每组排数、每排座位数一个都不能变。",
-  "   每组排数见 shape.rows（按 groups 顺序一一对应），返回前请逐组核对。",
-  "4. 只能使用 roster 中出现的姓名，一个不多一个不少；不允许改名、不允许编造姓名。",
-  "5. 空座位保持为 null。",
-  "6. roster 中位于 singleSeat 的姓名不要放进 grid。",
-  "7. reason 只说思路（谁换到了哪一类位置、为什么这样更公平），不要复述整张座位表。",
-  "8. 用户追问时，基于你上一条给出的座位表继续调整，仍然返回完整网格。",
+  "1. 只返回 JSON，不要解释文字，不要 markdown 代码块围栏。",
+  "2. 下标必须在范围内：组 < current.length，排 < current[组].length，座 < current[组][排].length。",
+  "3. 绝对不要输出学生姓名，也不要输出座位表——只输出上面四种操作。",
+  "4. 用户说「第 N 组」时，指的是 groups 里那个叫「第 N 组」的项，不要按数组下标去猜。",
+  "5. ops 至少要有 1 个操作。",
+  "6. reason 只说思路（为什么这样更公平 / 为什么这么调），不要罗列操作细节。",
+  "7. 用户追问时，current 已经是上一轮调整后的结果，你基于它继续给出新的操作。",
 ].join("\n");
 
 /** 构造首轮的 system + user 消息 */
@@ -75,7 +103,7 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
   const inGrid = flattenNames(input.grid);
   const payload = {
     instruction: input.instruction,
-    shape: { rows: input.rows, seatsPerRow: input.seatsPerRow },
+    shape: { rows: rowCounts(input.grid), seatsPerRow: input.grid[0]?.[0]?.length ?? 0 },
     groups: input.labels,
     singleSeat: input.singleSeatName || null,
     roster: input.singleSeatName ? [...inGrid, input.singleSeatName] : inGrid,
@@ -89,18 +117,16 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
 export function stripToJson(text: string): string {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const body = (fenced?.[1] ?? text).trim();
-  // 起点取最早的 { 或 [（模型返回 {"reason":…,"grid":[…]} 时若只找 [ 会丢掉 reason）；
-  // 终点从后往前收缩到每个 } 或 ] 逐个试解析，命中第一个合法片段即返回。
+  // 从最早的 { 或 [ 起、从后往前收缩到 } 或 ] 逐个试解析，命中第一个合法片段即返回。
   const braces = [body.indexOf("{"), body.indexOf("[")].filter((i) => i >= 0);
   if (braces.length === 0) return body;
   const start = Math.min(...braces);
   for (let end = body.length; end > start; end--) {
     const ch = body[end - 1];
     if (ch !== "}" && ch !== "]") continue;
-    const cand = body.slice(start, end);
     try {
-      JSON.parse(cand);
-      return cand;
+      JSON.parse(body.slice(start, end));
+      return body.slice(start, end);
     } catch {
       /* 收缩到前一个 } / ] 再试 */
     }
@@ -108,343 +134,389 @@ export function stripToJson(text: string): string {
   return body.slice(start);
 }
 
-/**
- * 从解析结果里取出网格与理由。
- * 兼容两种返回：{"reason":…,"grid":[…]} 与裸数组 […]（后者理由为空）。
- * 两者都不像则返回 null。
- */
-export function extractGrid(raw: unknown): { grid: unknown; reason: string } | null {
-  if (Array.isArray(raw)) return { grid: raw, reason: "" };
-  if (raw && typeof raw === "object") {
-    const o = raw as Record<string, unknown>;
-    if (!("grid" in o)) return null;
-    return { grid: o.grid, reason: typeof o.reason === "string" ? o.reason.trim() : "" };
-  }
+// ===== 操作校验 =====
+
+const intInRange = (v: unknown, hi: number) =>
+  Number.isInteger(v) && (v as number) >= 0 && (v as number) < hi;
+
+/** 校验一个座位下标；合法返回 null，否则返回中文原因 */
+function seatRefError(raw: unknown, grid: Grid): string | null {
+  if (!Array.isArray(raw) || raw.length !== 3) return "不是 [组,排,座] 三元数组";
+  const [g, r, s] = raw as number[];
+  if (!intInRange(g, grid.length)) return `组下标越界：${g}（应为 0~${grid.length - 1}）`;
+  if (!intInRange(r, grid[g]!.length))
+    return `排下标越界：${r}（第 ${g + 1} 组应为 0~${grid[g]!.length - 1}）`;
+  if (!intInRange(s, grid[g]![r]!.length))
+    return `座下标越界：${s}（应为 0~${grid[g]![r]!.length - 1}）`;
   return null;
 }
 
-/** 校验网格结构与姓名集合；通过返回 null，否则返回中文原因 */
-export function validateGrid(
-  raw: unknown,
-  rows: number[],
-  seatsPerRow: number,
-  expectedNames: string[],
-): string | null {
-  if (!Array.isArray(raw)) return "返回的不是数组";
-  if (raw.length !== rows.length)
-    return `组数不符：应为 ${rows.length} 组，实际 ${raw.length} 组`;
+/** 校验一个排下标；合法返回 null，否则返回中文原因 */
+function rowRefError(raw: unknown, grid: Grid): string | null {
+  if (!Array.isArray(raw) || raw.length !== 2) return "不是 [组,排] 二元数组";
+  const [g, r] = raw as number[];
+  if (!intInRange(g, grid.length)) return `组下标越界：${g}（应为 0~${grid.length - 1}）`;
+  if (!intInRange(r, grid[g]!.length))
+    return `排下标越界：${r}（第 ${g + 1} 组应为 0~${grid[g]!.length - 1}）`;
+  return null;
+}
 
-  const names: string[] = [];
-  for (let g = 0; g < rows.length; g++) {
-    const grp = raw[g];
-    if (!Array.isArray(grp)) return `第 ${g + 1} 组不是数组`;
-    if (grp.length !== rows[g])
-      return `第 ${g + 1} 组排数不符：应为 ${rows[g]} 排，实际 ${grp.length} 排`;
-    for (let r = 0; r < rows[g]!; r++) {
-      const row = grp[r];
-      if (!Array.isArray(row)) return `第 ${g + 1} 组第 ${r + 1} 排不是数组`;
-      if (row.length !== seatsPerRow)
-        return `第 ${g + 1} 组第 ${r + 1} 排座位数不符：应为 ${seatsPerRow} 座，实际 ${row.length} 座`;
-      for (const seat of row) {
-        if (seat !== null && typeof seat !== "string")
-          return `座位值只能是姓名或 null，实际是 ${typeof seat}`;
-        if (seat) names.push(seat);
+/** 校验模型给出的操作列表；通过返回 null，否则返回中文原因 */
+export function validateOps(raw: unknown, grid: Grid): string | null {
+  if (!Array.isArray(raw)) return "ops 不是数组";
+  if (raw.length === 0) return "模型没有给出任何调整操作";
+
+  for (let i = 0; i < raw.length; i++) {
+    const at = `第 ${i + 1} 个操作`;
+    const o = raw[i];
+    if (!o || typeof o !== "object" || Array.isArray(o)) return `${at}不是对象`;
+    const rec = o as Record<string, unknown>;
+
+    switch (rec.op) {
+      case "swapSeats": {
+        const ea = seatRefError(rec.a, grid);
+        if (ea) return `${at}（swapSeats）的 a ${ea}`;
+        const eb = seatRefError(rec.b, grid);
+        if (eb) return `${at}（swapSeats）的 b ${eb}`;
+        break;
       }
+      case "swapRows": {
+        const ea = rowRefError(rec.a, grid);
+        if (ea) return `${at}（swapRows）的 a ${ea}`;
+        const eb = rowRefError(rec.b, grid);
+        if (eb) return `${at}（swapRows）的 b ${eb}`;
+        const [ag, ar] = rec.a as number[];
+        const [bg, br] = rec.b as number[];
+        const la = grid[ag]![ar]!.length;
+        const lb = grid[bg]![br]!.length;
+        if (la !== lb)
+          return `${at}（swapRows）两排座位数不同（${la} 座 vs ${lb} 座），无法整排对调`;
+        break;
+      }
+      case "rotateLR":
+        break;
+      case "rotateRows": {
+        const gi = rec.group;
+        if (gi !== null && !intInRange(gi, grid.length))
+          return `${at}（rotateRows）的 group 越界：${String(gi)}（应为 0~${grid.length - 1} 或 null）`;
+        if (!Number.isInteger(rec.by)) return `${at}（rotateRows）的 by 必须是整数，实际 ${String(rec.by)}`;
+        break;
+      }
+      default:
+        return `${at}的 op 不认识：${String(rec.op)}（可用 swapSeats / swapRows / rotateLR / rotateRows）`;
     }
   }
-
-  // 姓名多重集比对（重名也要能被正确检出）
-  const tally = (list: string[]) => {
-    const m = new Map<string, number>();
-    for (const n of list) m.set(n, (m.get(n) ?? 0) + 1);
-    return m;
-  };
-  const got = tally(names);
-  const want = tally(expectedNames);
-  const missing: string[] = [];
-  const extra: string[] = [];
-  for (const [n, c] of want) {
-    const d = c - (got.get(n) ?? 0);
-    if (d > 0) missing.push(d > 1 ? `${n}×${d}` : n);
-  }
-  for (const [n, c] of got) {
-    const d = c - (want.get(n) ?? 0);
-    if (d > 0) extra.push(d > 1 ? `${n}×${d}` : n);
-  }
-  if (missing.length || extra.length) {
-    const parts: string[] = [];
-    if (missing.length) parts.push(`少了 ${missing.length} 个：${missing.join("、")}`);
-    if (extra.length) parts.push(`多了 ${extra.length} 个：${extra.join("、")}`);
-    return `姓名对不上（${parts.join("；")}）`;
-  }
   return null;
 }
 
-/** 解析 + 校验 AI 返回 */
-export function parseArrangement(
-  text: string,
-  rows: number[],
-  seatsPerRow: number,
-  expectedNames: string[],
-): ParseResult {
+// ===== 操作执行 =====
+
+/** 组内排整体轮转：by 为正表示向后移 */
+function rotateRowsIn(g: (string | null)[][], by: number): (string | null)[][] {
+  const n = g.length;
+  if (n <= 1) return g;
+  const k = ((by % n) + n) % n;
+  if (k === 0) return g;
+  return [...g.slice(n - k), ...g.slice(0, n - k)];
+}
+
+/**
+ * 按顺序执行操作，返回新网格（不改动入参）。
+ * 前提：ops 已通过 validateOps —— 只做交换与轮转，姓名的多重集与各组维度必然不变。
+ */
+export function applyOps(grid: Grid, ops: SeatOp[]): Grid {
+  const out: Grid = grid.map((g) => g.map((r) => [...r]));
+
+  for (const op of ops) {
+    if (op.op === "swapSeats") {
+      const [ag, ar, as] = op.a;
+      const [bg, br, bs] = op.b;
+      const t = out[ag]![ar]![as];
+      out[ag]![ar]![as] = out[bg]![br]![bs];
+      out[bg]![br]![bs] = t;
+    } else if (op.op === "swapRows") {
+      const [ag, ar] = op.a;
+      const [bg, br] = op.b;
+      const t = out[ag]![ar];
+      out[ag]![ar] = out[bg]![br];
+      out[bg]![br] = t!;
+    } else if (op.op === "rotateLR") {
+      for (const g of out) for (const row of g) row.reverse();
+    } else {
+      const targets = op.group === null ? out.map((_, i) => i) : [op.group];
+      for (const gi of targets) out[gi] = rotateRowsIn(out[gi]!, op.by);
+    }
+  }
+  return out;
+}
+
+/** 把操作翻成人话，给用户核对（例：交换 第四组第7排第1座 与 第二组第8排第1座） */
+export function describeOps(ops: SeatOp[], labels: string[]): string {
+  const grp = (g: number) => labels[g] ?? `第 ${g + 1} 组`;
+  const seat = ([g, r, s]: SeatRef) => `${grp(g)}第${r + 1}排第${s + 1}座`;
+  const row = ([g, r]: RowRef) => `${grp(g)}第${r + 1}排`;
+  return ops
+    .map((o) => {
+      if (o.op === "swapSeats") return `交换 ${seat(o.a)} 与 ${seat(o.b)}`;
+      if (o.op === "swapRows") return `${row(o.a)} 与 ${row(o.b)} 整排对调`;
+      if (o.op === "rotateLR") return "每组每排左右对调";
+      const dir = o.by > 0 ? `向后轮转 ${o.by} 排` : `向前轮转 ${-o.by} 排`;
+      return o.group === null ? `所有组${dir}` : `${grp(o.group)}${dir}`;
+    })
+    .join("；");
+}
+
+/** 解析 + 校验 + 执行 AI 返回 */
+export function parseArrangement(text: string, grid: Grid, labels: string[]): ParseResult {
   let raw: unknown;
   try {
     raw = JSON.parse(stripToJson(text));
   } catch (e) {
     return { ok: false, error: `返回不是合法 JSON：${e}` };
   }
-  const got = extractGrid(raw);
-  if (!got)
-    return {
-      ok: false,
-      error: '返回里没有 grid 字段（应为 {"reason":"…","grid":[[…]]}）',
-    };
-  const bad = validateGrid(got.grid, rows, seatsPerRow, expectedNames);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    return { ok: false, error: '返回应为 {"reason":"…","ops":[…] } 对象' };
+
+  const rec = raw as Record<string, unknown>;
+  const reason = typeof rec.reason === "string" ? rec.reason.trim() : "";
+  const bad = validateOps(rec.ops, grid);
   if (bad) return { ok: false, error: bad };
-  return { ok: true, grid: got.grid as (string | null)[][][], reason: got.reason };
+
+  const ops = rec.ops as SeatOp[];
+  return { ok: true, grid: applyOps(grid, ops), reason, ops, summary: describeOps(ops, labels) };
 }
 
-/** 追问时追加的消息：把上一轮模型原文和本轮要求接进对话 */
+/** 追问时追加的消息：本轮 payload 必须按「当前网格」重建，模型才知道现在的状态 */
 export function appendFollowUp(
   messages: ChatMessage[],
   previousReply: string,
-  instruction: string,
+  nextPayload: string,
 ): ChatMessage[] {
   return [
     ...messages,
     { role: "assistant", content: previousReply },
-    { role: "user", content: instruction },
+    { role: "user", content: nextPayload },
   ];
 }
 
 /** 自检：样例该过的过、该拒的拒；失败抛 Error */
 export function runAiSelfCheck(): void {
-  const rows = [2, 2];
-  const seatsPerRow = 2;
-  const expected = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛"];
-  const goodGrid: (string | null)[][][] = [
+  const labels = ["第四组", "第三组"];
+  // 组 0 有 2 排，组 1 有 3 排——刻意不整齐，用于暴露维度相关的问题
+  const base: Grid = [
     [
-      ["甲", "乙"],
-      ["丙", "丁"],
+      ["a1", "a2"],
+      ["b1", "b2"],
     ],
     [
-      ["戊", "己"],
-      ["庚", "辛"],
+      ["c1", "c2"],
+      ["d1", "d2"],
+      ["e1", "e2"],
     ],
   ];
+  const names = flattenNames(base).slice().sort().join();
+  const snapshot = JSON.stringify(base);
 
-  const cases: Array<[string, unknown, boolean]> = [
-    ["正常", goodGrid, true],
-    [
-      "漏名字",
+  const must = (cond: boolean, msg: string) => {
+    if (!cond) throw new Error(msg);
+  };
+  /** 执行操作后姓名多重集必须不变——这是本架构的核心不变量 */
+  const applyAndCheck = (ops: SeatOp[], label: string) => {
+    const out = applyOps(base, ops);
+    must(flattenNames(out).slice().sort().join() === names, `${label}：姓名集合被改变了`);
+    must(
+      JSON.stringify(rowCounts(out)) === JSON.stringify(rowCounts(base)),
+      `${label}：各组排数被改变了`,
+    );
+    must(JSON.stringify(base) === snapshot, `${label}：applyOps 改动了入参`);
+    return out;
+  };
+
+  // ---- 各操作的正确性 ----
+  {
+    const out = applyAndCheck([{ op: "swapSeats", a: [0, 0, 0], b: [1, 2, 1] }], "swapSeats");
+    must(out[0]![0]![0] === "e2" && out[1]![2]![1] === "a1", "swapSeats 未正确交换");
+    must(out[0]![0]![1] === "a2", "swapSeats 误伤了其它座位");
+  }
+  {
+    const out = applyAndCheck([{ op: "swapSeats", a: [0, 0, 0], b: [0, 0, 1] }], "swapSeats 同组同排");
+    must(out[0]![0]![0] === "a2" && out[0]![0]![1] === "a1", "同排内交换失败");
+  }
+  {
+    const out = applyAndCheck([{ op: "swapRows", a: [0, 0], b: [1, 2] }], "swapRows 跨组");
+    must(out[0]![0]!.join() === "e1,e2" && out[1]![2]!.join() === "a1,a2", "swapRows 跨组失败");
+  }
+  {
+    const out = applyAndCheck([{ op: "swapRows", a: [1, 0], b: [1, 2] }], "swapRows 同组");
+    must(out[1]![0]!.join() === "e1,e2" && out[1]![2]!.join() === "c1,c2", "swapRows 同组失败");
+  }
+  {
+    const out = applyAndCheck([{ op: "rotateLR" }], "rotateLR");
+    must(out[0]![0]!.join() === "a2,a1", "rotateLR 未左右对调");
+    must(out[1]![2]!.join() === "e2,e1", "rotateLR 漏了后面的组");
+  }
+  {
+    const out = applyAndCheck([{ op: "rotateRows", group: 0, by: 1 }], "rotateRows 单组向后");
+    must(out[0]!.map((r) => r[0]).join() === "b1,a1", "rotateRows 向后 1 排不对");
+    must(out[1]![0]![0] === "c1", "rotateRows 误动了别的组");
+  }
+  {
+    const out = applyAndCheck([{ op: "rotateRows", group: 0, by: -1 }], "rotateRows 向前等于向后 n-1");
+    must(out[0]!.map((r) => r[0]).join() === "b1,a1", "rotateRows 向前 1 排不对");
+  }
+  {
+    const out = applyAndCheck([{ op: "rotateRows", group: null, by: 1 }], "rotateRows 全部组");
+    must(out[0]!.map((r) => r[0]).join() === "b1,a1", "全部组时第 1 组不对");
+    must(out[1]!.map((r) => r[0]).join() === "e1,c1,d1", "全部组时第 2 组（3 排）不对");
+  }
+  {
+    const out = applyAndCheck([{ op: "rotateRows", group: 0, by: 2 }], "rotateRows by=排数 等价于不动");
+    must(out[0]!.map((r) => r[0]).join() === "a1,b1", "by 等于排数时应还原");
+  }
+  {
+    // 多操作按顺序叠加：先换 a1↔b1，再左右对调
+    const out = applyAndCheck(
       [
-        [
-          ["甲", "乙"],
-          ["丙", "丁"],
-        ],
-        [
-          ["戊", "己"],
-          ["庚", null],
-        ],
+        { op: "swapSeats", a: [0, 0, 0], b: [0, 1, 0] },
+        { op: "rotateLR" },
       ],
-      false,
-    ],
-    ["组数不符", [goodGrid[0]], false],
-    [
-      "排数不符",
-      [
-        [["甲", "乙"]],
-        [
-          ["戊", "己"],
-          ["庚", "辛"],
-        ],
-      ],
-      false,
-    ],
-    [
-      "座位数不符",
-      [
-        [
-          ["甲", "乙", "丙"],
-          ["丁"],
-        ],
-        [
-          ["戊", "己"],
-          ["庚", "辛"],
-        ],
-      ],
-      false,
-    ],
-    [
-      "重名",
-      [
-        [
-          ["甲", "甲"],
-          ["丙", "丁"],
-        ],
-        [
-          ["戊", "己"],
-          ["庚", "辛"],
-        ],
-      ],
-      false,
-    ],
-    ["座位值类型", [[[1, "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]], false],
-    ["座位值是数组", [[[["甲"], "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]], false],
-    ["不是数组", { a: 1 }, false],
+      "多操作叠加",
+    );
+    must(out[0]![0]!.join() === "a2,b1", `多操作叠加结果应为 a2,b1，实际 ${out[0]![0]!.join()}`);
+    must(out[0]![1]!.join() === "b2,a1", `多操作叠加第二排应为 b2,a1，实际 ${out[0]![1]!.join()}`);
+  }
+
+  // ---- 操作校验：该拒的必须拒 ----
+  const badCases: Array<[string, unknown]> = [
+    ["ops 不是数组", {}],
+    ["ops 为空", []],
+    ["操作不是对象", [1]],
+    ["op 不认识", [{ op: "deleteStudent", a: [0, 0, 0] }]],
+    ["swapSeats 的 a 不是三元数组", [{ op: "swapSeats", a: [0, 0], b: [0, 0, 0] }]],
+    ["swapSeats 组下标越界", [{ op: "swapSeats", a: [9, 0, 0], b: [0, 0, 0] }]],
+    ["swapSeats 排下标越界", [{ op: "swapSeats", a: [1, 9, 0], b: [0, 0, 0] }]],
+    ["swapSeats 座下标越界", [{ op: "swapSeats", a: [0, 0, 9], b: [0, 0, 0] }]],
+    ["swapSeats 下标为负", [{ op: "swapSeats", a: [-1, 0, 0], b: [0, 0, 0] }]],
+    ["swapSeats 下标非整数", [{ op: "swapSeats", a: [0, 0, 1.5], b: [0, 0, 0] }]],
+    ["swapRows 的 a 不是二元数组", [{ op: "swapRows", a: [0], b: [0, 0] }]],
+    ["swapRows 排下标越界", [{ op: "swapRows", a: [0, 9], b: [1, 0] }]],
+    ["rotateRows group 越界", [{ op: "rotateRows", group: 9, by: 1 }]],
+    ["rotateRows by 非整数", [{ op: "rotateRows", group: 0, by: 1.5 }]],
   ];
+  for (const [name, raw] of badCases) {
+    must(validateOps(raw, base) !== null, `样例「${name}」应被拒绝，实际通过了`);
+  }
 
-  for (const [name, raw, shouldPass] of cases) {
-    const err = validateGrid(raw, rows, seatsPerRow, expected);
-    const passed = err === null;
-    if (passed !== shouldPass) {
-      throw new Error(
-        `样例「${name}」期望${shouldPass ? "通过" : "被拒"}，实际${passed ? "通过" : `被拒（${err}）`}`,
-      );
+  /** 同组内两排座位数不同时，整排对调必须被拒 */
+  {
+    const uneven: Grid = [[["a"], ["b", "c"]]];
+    const err = validateOps([{ op: "swapRows", a: [0, 0], b: [0, 1] }], uneven);
+    must(err !== null && err.includes("座位数不同"), `座位数不同的整排对调应被拒，实际：${err}`);
+  }
+
+  // ---- 端到端解析 ----
+  const reply = (body: unknown) => JSON.stringify(body);
+  {
+    const r = parseArrangement(
+      reply({ reason: "左右对调更公平", ops: [{ op: "rotateLR" }] }),
+      base,
+      labels,
+    );
+    must(r.ok, `标准返回应通过，实际：${r.ok ? "" : r.error}`);
+    if (r.ok) {
+      must(r.reason.includes("更公平"), "reason 未取出");
+      must(r.grid[0]![0]!.join() === "a2,a1", "网格未按操作执行");
+      must(r.summary.includes("左右对调"), `summary 应可读，实际：${r.summary}`);
     }
   }
-
-  // 座位值类型非法必须被类型检查直接点名（不能只靠后面的姓名比对兜底）
-  const typeReason = validateGrid(
-    [[[1, "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]],
-    rows,
-    seatsPerRow,
-    expected,
-  );
-  if (typeReason === null || !typeReason.includes("座位值只能是姓名或 null"))
-    throw new Error(`座位值类型非法应由类型检查拒绝，实际：${typeReason}`);
-
-  // 展平
-  if (flattenNames(goodGrid).length !== 8) throw new Error("flattenNames 应取到 8 个姓名");
-
-  // 标准形态：{"reason":…,"grid":[…]}，理由要能取出来
   {
-    const reply = JSON.stringify({ reason: "按前后轮转，避免有人总坐前排。", grid: goodGrid });
-    const r = parseArrangement(reply, rows, seatsPerRow, expected);
-    if (!r.ok) throw new Error(`标准返回应能解析，实际被拒：${r.error}`);
-    if (!r.reason.includes("前后轮转")) throw new Error(`reason 未取出，实际：${r.reason}`);
-  }
-
-  // 裸数组（无 reason）仍应被接受，理由为空
-  {
-    const r = parseArrangement(JSON.stringify(goodGrid), rows, seatsPerRow, expected);
-    if (!r.ok) throw new Error(`裸数组返回应能解析，实际被拒：${r.error}`);
-    if (r.reason !== "") throw new Error(`裸数组的 reason 应为空串，实际：${r.reason}`);
-  }
-
-  // 有 grid 但网格不合法 → 拒绝，理由透传
-  {
-    const bad = JSON.stringify({ reason: "x", grid: [goodGrid[0]] });
-    const r = parseArrangement(bad, rows, seatsPerRow, expected);
-    if (r.ok) throw new Error("组数不符的返回应被拒绝");
-  }
-
-  // 缺 grid 字段 → 明确报缺字段，而不是笼统地说「不是数组」
-  {
-    const r = parseArrangement(JSON.stringify({ reason: "只有理由" }), rows, seatsPerRow, expected);
-    if (r.ok) throw new Error("缺 grid 字段的返回应被拒绝");
-    if (!r.error.includes("grid")) throw new Error(`错误应点名缺少 grid，实际：${r.error}`);
-  }
-
-  // 带 markdown 围栏与前后闲话的标准返回也要能剥出来
-  {
-    const reply = JSON.stringify({ reason: "轮换前后排。", grid: goodGrid });
-    const wrapped = "好的，结果如下：\n```json\n" + reply + "\n```\n以上。";
-    const r = parseArrangement(wrapped, rows, seatsPerRow, expected);
-    if (!r.ok) throw new Error(`带围栏的返回应能解析，实际被拒：${r.error}`);
-    if (!r.reason) throw new Error("带围栏返回的 reason 不应为空");
-  }
-
-  // 正确 JSON 后跟含方括号的闲话也应整体解析成功（不能被括号切片截坏）
-  {
-    const reply = JSON.stringify({ reason: "轮换[前后排]，更公平[1]。", grid: goodGrid });
-    const trailing = reply + " 已调整[公平]，请查看[1]。";
-    const r = parseArrangement(trailing, rows, seatsPerRow, expected);
-    if (!r.ok) throw new Error(`尾部闲话含方括号的返回应能解析，实际被拒：${r.error}`);
-    if (!r.reason.includes("前后排"))
-      throw new Error(`尾部闲话场景的 reason 应完整取出，实际：${r.reason}`);
-  }
-
-  // 凭空多出一个名字必须被拒
-  const extra = JSON.parse(JSON.stringify(goodGrid)) as (string | null)[][][];
-  extra[1]![1]![1] = "壬";
-  if (validateGrid(extra, rows, seatsPerRow, expected) === null)
-    throw new Error("多出未在名单中的姓名应被拒绝");
-
-  // 同时缺名与多名：理由里必须同时点出「少了」和「多了」
-  const swap = JSON.parse(JSON.stringify(goodGrid)) as (string | null)[][][];
-  swap[0]![0]![1] = "壬";
-  const swapReason = validateGrid(swap, rows, seatsPerRow, expected);
-  if (swapReason === null) throw new Error("少一个又多一个的网格应被拒绝");
-  if (!swapReason.includes("少了") || !swapReason.includes("多了"))
-    throw new Error(`理由应同时包含「少了」与「多了」，实际：${swapReason}`);
-
-  // 非 JSON 文本必须被拒，而不是抛异常
-  const notJson = parseArrangement("这不是 JSON", rows, seatsPerRow, expected);
-  if (notJson.ok) throw new Error("非 JSON 文本应被拒绝");
-
-  // buildMessages 发出的 roster 必须与 validateGrid 期待的名单对齐：网格名 + 单座名，current 原样携带
-  {
-    const grid: (string | null)[][][] = [
+    // summary 要把下标翻成组名与「第 N 排第 M 座」，用户才能核对
+    const s = describeOps(
       [
-        ["甲", "乙"],
-        ["丙", null],
+        { op: "swapRows", a: [0, 0], b: [1, 2] },
+        { op: "rotateRows", group: 1, by: -2 },
+        { op: "rotateRows", group: null, by: 1 },
       ],
-      [
-        ["丁", "戊"],
-        ["己", null],
-      ],
-    ];
-    const { user } = buildMessages({
-      grid,
-      labels: ["第一组", "第二组"],
+      labels,
+    );
+    must(s.includes("第四组第1排"), `summary 应用组名与排号，实际：${s}`);
+    must(s.includes("第三组第3排"), `summary 应用组名与排号，实际：${s}`);
+    must(s.includes("向前轮转 2 排"), `负 by 应说「向前」，实际：${s}`);
+    must(s.includes("所有组向后轮转 1 排"), `group=null 应说「所有组」，实际：${s}`);
+  }
+  {
+    // 座位级操作的 summary 要精确到座
+    const s = describeOps([{ op: "swapSeats", a: [0, 0, 1], b: [1, 2, 0] }], labels);
+    must(s.includes("第四组第1排第2座"), `summary 应精确到座，实际：${s}`);
+    must(s.includes("第三组第3排第1座"), `summary 应精确到座，实际：${s}`);
+  }
+  {
+    // 带 markdown 围栏
+    const body = reply({ reason: "r", ops: [{ op: "rotateLR" }] });
+    const r = parseArrangement("好的：\n```json\n" + body + "\n```\n以上", base, labels);
+    must(r.ok, `带围栏的返回应通过，实际：${r.ok ? "" : r.error}`);
+  }
+  {
+    // 尾部闲话含方括号
+    const body = reply({ reason: "轮换[前后排]", ops: [{ op: "rotateLR" }] });
+    const r = parseArrangement(body + " 已调整[公平]，见[1]", base, labels);
+    must(r.ok, `尾部含方括号的返回应通过，实际：${r.ok ? "" : r.error}`);
+    if (r.ok) must(r.reason.includes("前后排"), `reason 应完整，实际：${r.reason}`);
+  }
+  {
+    const r = parseArrangement("这不是 JSON", base, labels);
+    must(!r.ok, "非 JSON 文本应被拒");
+  }
+  {
+    const r = parseArrangement(reply([{ op: "rotateLR" }]), base, labels);
+    must(!r.ok, "裸数组返回应被拒（本版本要求对象）");
+  }
+  {
+    const r = parseArrangement(reply({ reason: "只有理由" }), base, labels);
+    must(!r.ok && r.error.includes("ops"), `缺 ops 应点名，实际：${r.ok ? "" : r.error}`);
+  }
+  {
+    // 模型自作主张输出座位表 → 必须被拒，而不是当作没调整
+    const r = parseArrangement(reply({ reason: "r", grid: base }), base, labels);
+    must(!r.ok, "模型输出 grid 而非 ops 时应被拒");
+  }
+
+  // ---- buildMessages ----
+  {
+    const { user, system } = buildMessages({
+      grid: base,
+      labels,
       singleSeatName: "庚",
       history: [],
       instruction: "换个坐法",
-      rows: [2, 2],
-      seatsPerRow: 2,
     });
-    const payload = JSON.parse(user) as {
+    const p = JSON.parse(user) as {
       roster: string[];
-      current: (string | null)[][][];
+      current: Grid;
       groups: string[];
       shape: { rows: number[]; seatsPerRow: number };
     };
-    const wantRoster = [...flattenNames(grid), "庚"];
-    if (JSON.stringify(payload.roster) !== JSON.stringify(wantRoster))
-      throw new Error(
-        `buildMessages 的 roster 应为网格姓名+单座，实际：${JSON.stringify(payload.roster)}`,
-      );
-    if (JSON.stringify(payload.current) !== JSON.stringify(grid))
-      throw new Error("buildMessages 的 current 应与输入网格一致");
-    // 组名必须原样带上：用户屏幕上的「第 N 组」与数组下标可能不同序
-    if (JSON.stringify(payload.groups) !== JSON.stringify(["第一组", "第二组"]))
-      throw new Error(`buildMessages 的 groups 应原样透传，实际：${JSON.stringify(payload.groups)}`);
-    if (JSON.stringify(payload.shape.rows) !== JSON.stringify([2, 2]))
-      throw new Error("buildMessages 的 shape.rows 应与输入排数一致");
-    // 该 roster 正是 parseArrangement 期待的名单（expectedNames 取网格名）
-    const okRes = parseArrangement(
-      JSON.stringify({ reason: "r", grid }),
-      rows,
-      seatsPerRow,
-      flattenNames(grid),
+    must(
+      JSON.stringify(p.roster) === JSON.stringify([...flattenNames(base), "庚"]),
+      `roster 应为网格姓名+单座，实际：${JSON.stringify(p.roster)}`,
     );
-    if (!okRes.ok) throw new Error(`网格对自身 roster 的校验应通过，实际被拒：${okRes.error}`);
+    must(JSON.stringify(p.current) === JSON.stringify(base), "current 应与输入网格一致");
+    must(JSON.stringify(p.groups) === JSON.stringify(labels), "groups 应原样透传");
+    must(JSON.stringify(p.shape.rows) === JSON.stringify([2, 3]), "shape.rows 应为各组排数");
+    must(!system.includes("座位表本身") === false, "系统提示应说明不输出座位表");
   }
 
-  // 追问：上一轮模型原文与本轮要求必须按 assistant → user 顺序接在后面
+  // ---- appendFollowUp ----
   {
-    const base: ChatMessage[] = [
+    const msgs: ChatMessage[] = [
       { role: "system", content: "s" },
       { role: "user", content: "u1" },
     ];
-    const next = appendFollowUp(base, "reply1", "再换一次");
-    if (next.length !== 4) throw new Error(`追问后应有 4 条消息，实际 ${next.length}`);
-    if (next[2]!.role !== "assistant" || next[2]!.content !== "reply1")
-      throw new Error("第 3 条应为上一轮的 assistant 原文");
-    if (next[3]!.role !== "user" || next[3]!.content !== "再换一次")
-      throw new Error("第 4 条应为本轮的 user 要求");
-    if (base.length !== 2) throw new Error("appendFollowUp 不应改动原数组");
+    const next = appendFollowUp(msgs, "reply1", "u2");
+    must(next.length === 4, `追问后应有 4 条消息，实际 ${next.length}`);
+    must(next[2]!.role === "assistant" && next[2]!.content === "reply1", "第 3 条应为上一轮原文");
+    must(next[3]!.role === "user" && next[3]!.content === "u2", "第 4 条应为本轮 payload");
+    must(msgs.length === 2, "appendFollowUp 不应改动原数组");
   }
 }
 
@@ -457,10 +529,7 @@ export async function loadAiConfig(): Promise<LoadedAiConfig> {
 }
 
 /** 调 AI 排座，返回模型输出的原始文本 */
-export async function arrangeSeats(
-  config: AiConfig,
-  messages: ChatMessage[],
-): Promise<string> {
+export async function arrangeSeats(config: AiConfig, messages: ChatMessage[]): Promise<string> {
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("ai_arrange", { config, messages });
 }

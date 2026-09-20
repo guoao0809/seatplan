@@ -57,13 +57,14 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
   "baseUrl": "https://api.deepseek.com/v1",
   "apiKey": "sk-your-key",
   "model": "deepseek-v4-pro",
-  "temperature": 0.7
+  "temperature": 0.7,
+  "reasoningEffort": "none"
 }
 ```
 
 - `baseUrl` 不写 `/v1` 也可以，程序会自动补上；DeepSeek、通义、智谱、Kimi、OpenAI 的官方地址同样适用
 - `temperature` 可省略，默认 `0.7`
-- `reasoningEffort` 控制推理强度，**建议不填**。填 `"none"` 关掉思考能把排座从 20~50 秒压到 5 秒左右，但实测会让模型在「第三组最后一排和第一组最后一排对调」这类精确指令上**静默排错**——它会自述已完成、结果也能通过校验，实际却没做。只有在你只下开放式指令（如「保证每个孩子都公平」）且更在意速度时才用它
+- `reasoningEffort` 控制推理强度。**不填默认 `none`（关掉思考）**——模型只输出「交换哪两排 / 左右对调」这类操作，实际排座由程序执行，不需要深度推理；实测 2~4 秒出结果。若某条复杂指令排得不合意，可填 `off` 走模型默认（会慢一些但更会「琢磨」），或填 `low` / `medium` / `high`
 - 该文件已被 `.gitignore` 忽略（含明文密钥，**不要提交**）
 
 找不到或格式错误时，AI 弹窗会直接显示实际查找过的路径。

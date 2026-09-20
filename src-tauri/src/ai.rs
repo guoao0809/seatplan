@@ -17,21 +17,21 @@ pub struct AiConfig {
     pub model: String,
     #[serde(default)]
     pub temperature: Option<f64>,
-    /// 推理强度。**不填则使用模型默认（推荐）**。
-    /// 注意：填 "none" 关掉思考确实快（53s → 7s），但实测会让模型
-    /// 在「第 N 组最后一排对调」这类精确指令上静默排错——自述已完成、校验能过，实际没做。
-    /// 仅在能接受这种风险的场景下使用。填 "off" 与不填等效。
+    /// 推理强度。不填默认 "none"（关掉思考）——实测 2~4 秒出结果，且 10/10 条指令
+    /// 都被正确翻译成操作。之所以敢关：模型只输出「交换/轮转」这类操作，机械活儿全由
+    /// 代码执行，排错了在「将执行的操作」里一眼可见，不会像直接输出座位表那样静默排错。
+    /// 填 "off" 则不发送该参数（走模型默认，复杂多约束指令可用）；也可填 low / medium / high。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
 
 /// 解析要发给网关的 reasoning_effort。
-/// None（未配置）与 Some("off") 都不发该参数，交给模型默认——实测最可靠。
-/// 其余值原样透传（如 "none" / "low" / "high"）。
+/// None（未配置）→ "none"；Some("off") → 不发该参数；其余原样透传。
 fn reasoning_effort(config: &AiConfig) -> Option<&str> {
     match config.reasoning_effort.as_deref() {
-        None | Some("off") => None,
+        Some("off") => None,
         Some(v) => Some(v),
+        None => Some("none"),
     }
 }
 
@@ -185,10 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_defaults_to_model_default() {
+    fn reasoning_effort_defaults_to_none() {
         let c: AiConfig =
             serde_json::from_str(r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m"}"#).unwrap();
-        assert_eq!(reasoning_effort(&c), None, "未配置时不应发送 reasoning_effort");
+        assert_eq!(reasoning_effort(&c), Some("none"));
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_passes_through_explicit_values() {
-        for (raw, want) in [("none", "none"), ("low", "low"), ("high", "high")] {
+        for (raw, want) in [("low", "low"), ("medium", "medium"), ("high", "high")] {
             let c: AiConfig = serde_json::from_str(&format!(
                 r#"{{"baseUrl":"http://x/v1","apiKey":"k","model":"m","reasoningEffort":"{raw}"}}"#
             ))
