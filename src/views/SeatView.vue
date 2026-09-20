@@ -68,6 +68,10 @@ const teacherView = ref(false);
 // 弹窗开关（名单 / 配置）
 const showRoster = ref(false);
 const showConfig = ref(false);
+// 配置弹窗的草稿：改它不影响页面，点「完成」才写回上面几个实时配置
+const cfgDraft = ref<GroupConfig[]>([]);
+const draftSeatsPerRow = ref(DEFAULT_SEATS_PER_ROW);
+const draftSingleSeat = ref("");
 
 // AI 排座
 const showAi = ref(false);
@@ -459,7 +463,7 @@ async function exportImage() {
 // 名单/配置变化时重铺网格；拖拽只改网格、不触发重铺
 // suppressSeed：挂载/回显期间为 true，避免名称或配置赋值触发的监听覆盖已还原的网格
 let suppressSeed = true;
-// 配置弹窗里改排数/配色时，只更新已有网格的配色，不重铺（否则会丢掉拖拽结果与 AI 排座结果）
+// 只改配色时不要重铺：rows 是 computed，每次求值都是新数组，直接 watch 会误触发
 watch(
   () => groupCfgs.value.map((c) => c.color).join(","),
   () => {
@@ -469,7 +473,8 @@ watch(
     });
   },
 );
-watch([rosterText, rows, seatCount], () => {
+// 排数/座位数/名单变了才重铺（用字符串比较，避免数组引用变化造成的误触发）
+watch([rosterText, () => rows.value.join(","), seatCount], () => {
   if (suppressSeed) return;
   seedGrid();
 });
@@ -541,29 +546,60 @@ watch(
   },
 );
 
-// ===== 配置弹窗：组的增删改 =====
+// ===== 配置弹窗：草稿态，点「完成」才作用到页面 =====
+// 直接改实时配置会立刻重铺网格，把拖拽结果和 AI 排座结果冲掉；故弹窗里改的是副本。
+
+/** 打开弹窗：把当前配置拷进草稿 */
+function openConfig() {
+  cfgDraft.value = groupCfgs.value.map((c) => ({ ...c }));
+  draftSeatsPerRow.value = seatsPerRow.value;
+  draftSingleSeat.value = singleSeatName.value;
+  showConfig.value = true;
+}
+/** 放弃草稿 */
+function cancelConfig() {
+  showConfig.value = false;
+}
+/** 应用草稿 */
+function applyConfig() {
+  groupCfgs.value = cfgDraft.value.map((c) => ({ ...c }));
+  seatsPerRow.value = draftSeatsPerRow.value;
+  singleSeatName.value = draftSingleSeat.value;
+  showConfig.value = false;
+}
 
 /** 新增一组：排数沿用最后一组，配色取调色板下一个 */
 function addGroup() {
-  const last = groupCfgs.value[groupCfgs.value.length - 1];
-  groupCfgs.value = [
-    ...groupCfgs.value,
-    { rows: last?.rows ?? 7, color: paletteColor(groupCfgs.value.length) },
-  ];
+  const last = cfgDraft.value[cfgDraft.value.length - 1];
+  const g: GroupConfig = {
+    rows: last?.rows ?? 7,
+    color: paletteColor(cfgDraft.value.length),
+  };
+  // 组名由下标推导（groupLabel）。开了「组号反向」时下标越大组号越小，
+  // 追加到末尾会让新组顶掉「第一组」这个名字、其余组整体改号；
+  // 故反向时插到最前，已有各组的组名保持不变。
+  cfgDraft.value = reverseGroups.value ? [g, ...cfgDraft.value] : [...cfgDraft.value, g];
 }
 /** 删除一组；至少保留一组 */
 function removeGroup(index: number) {
-  if (groupCfgs.value.length <= 1) {
+  if (cfgDraft.value.length <= 1) {
     showToast("至少要保留一组", "info");
     return;
   }
-  groupCfgs.value = groupCfgs.value.filter((_, i) => i !== index);
+  cfgDraft.value = cfgDraft.value.filter((_, i) => i !== index);
 }
-/** 改排数：允许中途为空，提交时收敛到 ≥1 的整数 */
+/** 改排数：允许中途为空，非正整数一律收敛到 1 */
 function setGroupRows(index: number, value: string) {
   const n = Math.floor(Number(value));
-  groupCfgs.value[index]!.rows = Number.isFinite(n) && n >= 1 ? n : 1;
+  cfgDraft.value[index]!.rows = Number.isFinite(n) && n >= 1 ? n : 1;
 }
+
+/** 草稿对应的容量，供弹窗内实时显示 */
+const draftCapacity = computed(
+  () =>
+    cfgDraft.value.reduce((n, c) => n + c.rows, 0) *
+    Math.max(1, Number(draftSeatsPerRow.value) || 1),
+);
 </script>
 
 <template>
@@ -579,7 +615,7 @@ function setGroupRows(index: number, value: string) {
       </button>
       <button
         class="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
-        @click="showConfig = true"
+        @click="openConfig"
       >
         <Settings :size="14" />
         配置
@@ -764,18 +800,18 @@ function setGroupRows(index: number, value: string) {
       </div>
     </div>
 
-    <!-- 配置弹窗 -->
+    <!-- 配置弹窗：改的是草稿，点「完成」才写回实时配置 -->
     <div
       v-if="showConfig"
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
-      @click.self="showConfig = false"
+      @click.self="cancelConfig"
     >
-      <div class="flex w-105 flex-col rounded-xl bg-panel shadow-2xl">
+      <div class="flex max-h-[88vh] w-105 flex-col rounded-xl bg-panel shadow-2xl">
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">配置</span>
           <button
             class="rounded p-1 text-muted hover:bg-surface hover:text-title"
-            @click="showConfig = false"
+            @click="cancelConfig"
           >
             <X :size="16" />
           </button>
@@ -784,7 +820,7 @@ function setGroupRows(index: number, value: string) {
           <div>
             <label class="text-xs text-text">每排座位数</label>
             <input
-              v-model.number="seatsPerRow"
+              v-model.number="draftSeatsPerRow"
               type="number"
               min="1"
               class="mt-1 w-full rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
@@ -813,12 +849,12 @@ function setGroupRows(index: number, value: string) {
                 <span class="w-6"></span>
               </div>
               <div
-                v-for="(g, gi) in groupCfgs"
+                v-for="(g, gi) in cfgDraft"
                 :key="gi"
                 class="flex items-center gap-2 border-b border-border px-2.5 py-1.5 last:border-b-0"
               >
                 <span class="w-16 shrink-0 text-xs text-text">
-                  {{ groupLabel(gi, groupCfgs.length, reverseGroups) }}
+                  {{ groupLabel(gi, cfgDraft.length, reverseGroups) }}
                 </span>
                 <input
                   :value="g.rows"
@@ -850,19 +886,29 @@ function setGroupRows(index: number, value: string) {
           <div>
             <label class="text-xs text-text">单座学生姓名</label>
             <input
-              v-model="singleSeatName"
+              v-model="draftSingleSeat"
               placeholder="该单独座位上的学生"
               class="mt-1 w-full rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
             />
           </div>
           <p class="text-xs leading-relaxed text-muted">
-            共 {{ groupCount }} 组 / 每排 {{ seatCount }} 座 / 容量 {{ capacity }} 座
+            改后：共 {{ cfgDraft.length }} 组 / 每排
+            {{ Math.max(1, Number(draftSeatsPerRow) || 1) }} 座 / 容量 {{ draftCapacity }} 座
+            <span v-if="nameCount > draftCapacity" class="text-red-500">
+              （名单 {{ nameCount }} 人，超出容量，排不下的会落空）
+            </span>
           </p>
         </div>
         <div class="flex justify-end gap-2 border-t border-border px-5 py-3">
           <button
+            class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+            @click="cancelConfig"
+          >
+            取消
+          </button>
+          <button
             class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
-            @click="showConfig = false"
+            @click="applyConfig"
           >
             完成
           </button>
