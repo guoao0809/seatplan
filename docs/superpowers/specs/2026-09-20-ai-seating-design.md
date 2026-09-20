@@ -80,7 +80,7 @@ Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截，所以请
 
 ```json
 {
-  "baseUrl": "http://ai.medical-deep.com:20248/v1",
+  "baseUrl": "http://your-gateway.example:20248/v1",
   "apiKey": "sk-xxx",
   "model": "deepseek-v4-pro",
   "temperature": 0.7
@@ -96,7 +96,7 @@ Tauri 的 WebView 内直接 `fetch` 第三方 API 会被 CORS 拦截，所以请
 ### 该网关的两个特征
 
 - **明文 HTTP**：`http://`，非 HTTPS，API Key 明文经网络传输。内网网关，可接受。走 Rust 命令后**不涉及任何权限配置**，无需为此做额外放行。
-- **无 `/v1` 前缀**：`normalize_base()` 会自动补，所以配置里写 `http://ai.medical-deep.com:20248` 或带 `/v1` 均可。
+- **无 `/v1` 前缀**：`normalize_base()` 会自动补，所以配置里写 `http://your-gateway.example:20248` 或带 `/v1` 均可。
 
 ## 提示词与校验
 

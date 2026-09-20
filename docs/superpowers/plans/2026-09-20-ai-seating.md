@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn normalize_appends_v1_when_missing() {
         assert_eq!(
-            normalize_base("http://ai.medical-deep.com:20248"),
-            "http://ai.medical-deep.com:20248/v1"
+            normalize_base("http://your-gateway.example:20248"),
+            "http://your-gateway.example:20248/v1"
         );
     }
 
@@ -120,8 +120,8 @@ mod tests {
     #[test]
     fn request_url_appends_chat_completions() {
         assert_eq!(
-            request_url("http://ai.medical-deep.com:20248"),
-            "http://ai.medical-deep.com:20248/v1/chat/completions"
+            request_url("http://your-gateway.example:20248"),
+            "http://your-gateway.example:20248/v1/chat/completions"
         );
     }
 
@@ -397,7 +397,7 @@ cd src-tauri && cargo test
 
 ```json
 {
-  "baseUrl": "http://ai.medical-deep.com:20248",
+  "baseUrl": "http://your-gateway.example:20248",
   "apiKey": "sk-your-key",
   "model": "deepseek-v4-pro",
   "temperature": 0.7

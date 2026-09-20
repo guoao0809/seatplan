@@ -70,9 +70,21 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
 export function stripToJson(text: string): string {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const body = (fenced?.[1] ?? text).trim();
+  // 从第一个 [ 起、按 ] 位置从后往前收缩，取第一个能解析成功的片段：
+  // 整段是纯 JSON 时首个候选（最长片段）直接命中——等价于先试 JSON.parse；
+  // 网格后跟含方括号的闲话（「已调整[公平]，请查看[1]」）也不会被截坏。
   const start = body.indexOf("[");
-  const end = body.lastIndexOf("]");
-  return start >= 0 && end > start ? body.slice(start, end + 1) : body;
+  if (start < 0) return body;
+  for (let end = body.lastIndexOf("]"); end > start; end = body.lastIndexOf("]", end - 1)) {
+    const cand = body.slice(start, end + 1);
+    try {
+      JSON.parse(cand);
+      return cand;
+    } catch {
+      /* 收缩到前一个 ] 再试 */
+    }
+  }
+  return body.slice(start);
 }
 
 /** 校验网格结构与姓名集合；通过返回 null，否则返回中文原因 */
@@ -275,6 +287,49 @@ export function runAiSelfCheck(): void {
   // 维度不符时也应走 ok:false，而不是抛异常
   const wrongShape = parseArrangement(JSON.stringify([good[0]]), rows, seatsPerRow, expected);
   if (wrongShape.ok) throw new Error("组数不符的返回应被拒绝");
+
+  // buildMessages 发出的 roster 必须与 validateGrid 期待的名单对齐：网格名 + 单座名，current 原样携带
+  {
+    const grid: (string | null)[][][] = [
+      [
+        ["甲", "乙"],
+        ["丙", null],
+      ],
+      [
+        ["丁", "戊"],
+        ["己", null],
+      ],
+    ];
+    const { user } = buildMessages({
+      grid,
+      singleSeatName: "庚",
+      history: [],
+      instruction: "换个坐法",
+      rows: [2, 2],
+      seatsPerRow: 2,
+    });
+    const payload = JSON.parse(user) as {
+      roster: string[];
+      current: (string | null)[][][];
+    };
+    const wantRoster = [...flattenNames(grid), "庚"];
+    if (JSON.stringify(payload.roster) !== JSON.stringify(wantRoster))
+      throw new Error(
+        `buildMessages 的 roster 应为网格姓名+单座，实际：${JSON.stringify(payload.roster)}`,
+      );
+    if (JSON.stringify(payload.current) !== JSON.stringify(grid))
+      throw new Error("buildMessages 的 current 应与输入网格一致");
+    // 该 roster 正是 parseArrangement 期待的名单（expectedNames 取网格名）
+    const okRes = parseArrangement(JSON.stringify(grid), rows, seatsPerRow, flattenNames(grid));
+    if (!okRes.ok) throw new Error(`网格对自身 roster 的校验应通过，实际被拒：${okRes.reason}`);
+  }
+
+  // 正确 JSON 后跟含方括号的闲话也应整体解析成功（不能被括号切片截坏）
+  {
+    const trailing = JSON.stringify(good) + " 已调整[公平]，请查看[1]。";
+    const r2 = parseArrangement(trailing, rows, seatsPerRow, expected);
+    if (!r2.ok) throw new Error(`尾部闲话含方括号的返回应能解析，实际被拒：${r2.reason}`);
+  }
 }
 
 // ===== 与 Rust 通信（动态 import，保持本文件可独立自检）=====

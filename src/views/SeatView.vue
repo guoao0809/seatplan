@@ -62,6 +62,8 @@ const showConfig = ref(false);
 const showAi = ref(false);
 const aiPrompt = ref("根据上一次排的座位，自动左右调整，保证每个孩子都公平");
 const aiBusy = ref(false);
+// 单调递增的请求 id：closeAi 时 bump 作废在途请求，替代「弹窗是否还开着」这个不可靠代理
+let aiReqId = 0;
 const aiError = ref("");
 const aiConfigPath = ref("");
 // 配置读取状态：loading=读取中 ok=已载入 fail=读取失败（失败时 aiConfigPath 为空，需单独区分）
@@ -201,7 +203,6 @@ function toggleReverseGroups() {
 
 /** 打开 AI 弹窗并读取配置 */
 async function openAi() {
-  if (aiBusy.value) return; // 请求进行中不允许重读配置，避免清空 aiConfig 造成竞态
   aiError.value = "";
   aiPreview.value = null;
   aiConfigPath.value = "";
@@ -220,6 +221,8 @@ async function openAi() {
 }
 
 function closeAi() {
+  aiReqId++; // 作废在途请求：其结果/错误不再回写
+  aiBusy.value = false; // 工具条立即恢复可用
   showAi.value = false;
   aiPreview.value = null;
   aiError.value = "";
@@ -228,11 +231,16 @@ function closeAi() {
 /** 发送给 AI，校验返回；通过则进入预览态 */
 async function runAi() {
   if (aiBusy.value) return; // 重入保险：防止未来新增触发点导致并发请求
+  if (nameCount.value === 0) {
+    aiError.value = "没有学生，无法排座";
+    return;
+  }
   const cfg = aiConfig.value;
   if (!cfg) {
     aiError.value = "配置未加载，请检查 config.json";
     return;
   }
+  const id = ++aiReqId;
   aiBusy.value = true;
   aiError.value = "";
   try {
@@ -248,7 +256,7 @@ async function runAi() {
       seatsPerRow: seatCount.value,
     });
     const text = await arrangeSeats(cfg, messages.system, messages.user);
-    if (!showAi.value) return; // 弹窗已关：丢弃迟到结果（finally 仍会清 aiBusy）
+    if (id !== aiReqId) return; // 请求已被 closeAi 作废：丢弃迟到结果，不动 aiBusy
     const res = parseArrangement(text, rows.value, seatCount.value, flattenNames(grid));
     if (!res.ok) {
       aiError.value = `校验未通过：${res.reason}\n\n模型原始返回：\n${text}`;
@@ -256,10 +264,10 @@ async function runAi() {
     }
     aiPreview.value = res.grid;
   } catch (e) {
-    if (!showAi.value) return; // 弹窗已关：迟到错误不回写
+    if (id !== aiReqId) return; // 已作废的迟到错误不回写
     aiError.value = String(e);
   } finally {
-    aiBusy.value = false;
+    if (id === aiReqId) aiBusy.value = false; // 只清自己的请求，别清后来者的
   }
 }
 
@@ -699,7 +707,8 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             <template v-else-if="aiConfigStatus === 'fail'">配置读取失败（见下方错误）</template>
             <template v-else>正在读取配置…</template>
             <button
-              class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary"
+              class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border disabled:hover:text-current"
+              :disabled="aiBusy"
               @click="openAi"
             >
               重新读取
@@ -713,11 +722,11 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
           </div>
         </div>
 
-        <!-- 预览态 -->
+        <!-- 预览态：老师视角下与主座位图一致，整块旋转 180°（标签与座位转回正立） -->
         <div v-else class="min-h-0 flex-1 overflow-auto p-5">
-          <div class="flex items-start gap-6">
+          <div class="flex items-start gap-6" :class="teacherView ? 'rotate-180' : ''">
             <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
-              <div class="text-xs font-medium text-muted">
+              <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
                 {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
               </div>
               <div class="flex flex-col gap-1.5">
@@ -726,11 +735,12 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
                     v-for="(name, si) in row"
                     :key="si"
                     class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
-                    :class="
+                    :class="[
                       name
                         ? 'bg-[#86C166] text-white'
-                        : 'bg-surface border border-dashed border-border text-muted'
-                    "
+                        : 'bg-surface border border-dashed border-border text-muted',
+                      teacherView ? 'rotate-180' : '',
+                    ]"
                   >
                     {{ name || "—" }}
                   </div>

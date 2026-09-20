@@ -54,7 +54,7 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
 
 ```json
 {
-  "baseUrl": "http://ai.medical-deep.com:20248",
+  "baseUrl": "https://api.deepseek.com/v1",
   "apiKey": "sk-your-key",
   "model": "deepseek-v4-pro",
   "temperature": 0.7

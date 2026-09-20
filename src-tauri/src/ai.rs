@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
+// 实测网关完成一次排座要 53~80 秒；命令已 async + spawn_blocking（不冻 UI），
+// 且弹窗可在请求中途关闭，故放宽到 300 秒。
+const TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,8 +117,8 @@ mod tests {
     #[test]
     fn normalize_appends_v1_when_missing() {
         assert_eq!(
-            normalize_base("http://ai.medical-deep.com:20248"),
-            "http://ai.medical-deep.com:20248/v1"
+            normalize_base("http://your-gateway.example:20248"),
+            "http://your-gateway.example:20248/v1"
         );
     }
 
@@ -137,8 +139,8 @@ mod tests {
     #[test]
     fn request_url_appends_chat_completions() {
         assert_eq!(
-            request_url("http://ai.medical-deep.com:20248"),
-            "http://ai.medical-deep.com:20248/v1/chat/completions"
+            request_url("http://your-gateway.example:20248"),
+            "http://your-gateway.example:20248/v1/chat/completions"
         );
     }
 
