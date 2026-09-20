@@ -44,6 +44,29 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
 > Get-NetTCPConnection -LocalPort 1420 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
 > ```
 
+## AI 排座配置
+
+「AI 排座」需要一个 OpenAI 兼容接口。在下列任一位置放一个 `config.json`（程序只读，不会改写）：
+
+1. **开发期**：`src-tauri/config.json`
+2. **便携版**：与 `seatplan.exe` 同目录
+3. **安装版**：`%APPDATA%\com.seatplan.app\config.json`
+
+```json
+{
+  "baseUrl": "http://ai.medical-deep.com:20248",
+  "apiKey": "sk-your-key",
+  "model": "deepseek-v4-pro",
+  "temperature": 0.7
+}
+```
+
+- `baseUrl` 不写 `/v1` 也可以，程序会自动补上；DeepSeek、通义、智谱、Kimi、OpenAI 的官方地址同样适用
+- `temperature` 可省略，默认 `0.7`
+- 该文件已被 `.gitignore` 忽略（含明文密钥，**不要提交**）
+
+找不到或格式错误时，AI 弹窗会直接显示实际查找过的路径。
+
 ## 下载
 
 到 [Releases](https://github.com/guoao0809/seatplan/releases) 下载最新的 `SeatPlan_x.y.z_x64-setup.exe`，双击安装即可，无需额外环境。

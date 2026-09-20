@@ -1,9 +1,6 @@
 //! AI 排座接口调用（OpenAI 兼容协议）。
 //! URL 拼接与请求实现移植自 D:\wok\worknotes\gitreport\src-tauri\src\ai.rs。
 
-// ai_arrange 要到 Task 2 才注册进 invoke_handler，此前整模块都会被 dead_code 判死；注册后本属性可删。
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
