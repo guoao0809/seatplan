@@ -548,7 +548,9 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
 
     <!-- 座位图 -->
     <div class="min-h-0 flex-1 overflow-auto bg-surface p-6">
-      <div ref="seatChartRef" class="mx-auto w-fit rounded-xl bg-white p-8 shadow">
+      <!-- w-max 不能用 w-fit：fit-content 会被容器宽度夹住，座位溢出到元素盒子外，
+           html-to-image 按 clientWidth 量尺寸就会把右侧裁掉 -->
+      <div ref="seatChartRef" class="mx-auto w-max rounded-xl bg-white p-8 shadow">
         <div class="flex flex-col items-start gap-8">
           <!-- 前排：讲台（左侧）+ 右侧单独座位。老师视角下讲台转到右下角，单座同时换到讲台左侧 -->
           <div
