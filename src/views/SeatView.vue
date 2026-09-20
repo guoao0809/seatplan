@@ -64,6 +64,8 @@ const aiPrompt = ref("根据上一次排的座位，自动左右调整，保证�
 const aiBusy = ref(false);
 const aiError = ref("");
 const aiConfigPath = ref("");
+// 配置读取状态：loading=读取中 ok=已载入 fail=读取失败（失败时 aiConfigPath 为空，需单独区分）
+const aiConfigStatus = ref<"loading" | "ok" | "fail">("loading");
 const aiConfig = ref<AiConfig | null>(null);
 const aiPreview = ref<(string | null)[][][] | null>(null);
 
@@ -199,22 +201,25 @@ function toggleReverseGroups() {
 
 /** 打开 AI 弹窗并读取配置 */
 async function openAi() {
+  if (aiBusy.value) return; // 请求进行中不允许重读配置，避免清空 aiConfig 造成竞态
   aiError.value = "";
   aiPreview.value = null;
   aiConfigPath.value = "";
+  aiConfigStatus.value = "loading";
   aiConfig.value = null;
   showAi.value = true;
   try {
     const loaded = await loadAiConfig();
     aiConfig.value = loaded.config;
     aiConfigPath.value = loaded.path;
+    aiConfigStatus.value = "ok";
   } catch (e) {
+    aiConfigStatus.value = "fail";
     aiError.value = String(e);
   }
 }
 
 function closeAi() {
-  if (aiBusy.value) return;
   showAi.value = false;
   aiPreview.value = null;
   aiError.value = "";
@@ -222,6 +227,7 @@ function closeAi() {
 
 /** 发送给 AI，校验返回；通过则进入预览态 */
 async function runAi() {
+  if (aiBusy.value) return; // 重入保险：防止未来新增触发点导致并发请求
   const cfg = aiConfig.value;
   if (!cfg) {
     aiError.value = "配置未加载，请检查 config.json";
@@ -242,6 +248,7 @@ async function runAi() {
       seatsPerRow: seatCount.value,
     });
     const text = await arrangeSeats(cfg, messages.system, messages.user);
+    if (!showAi.value) return; // 弹窗已关：丢弃迟到结果（finally 仍会清 aiBusy）
     const res = parseArrangement(text, rows.value, seatCount.value, flattenNames(grid));
     if (!res.ok) {
       aiError.value = `校验未通过：${res.reason}\n\n模型原始返回：\n${text}`;
@@ -249,6 +256,7 @@ async function runAi() {
     }
     aiPreview.value = res.grid;
   } catch (e) {
+    if (!showAi.value) return; // 弹窗已关：迟到错误不回写
     aiError.value = String(e);
   } finally {
     aiBusy.value = false;
@@ -687,7 +695,8 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
           ></textarea>
           <div class="flex items-center gap-2 text-xs text-muted">
-            <template v-if="aiConfigPath">配置文件：{{ aiConfigPath }}</template>
+            <template v-if="aiConfigStatus === 'ok'">配置文件：{{ aiConfigPath }}</template>
+            <template v-else-if="aiConfigStatus === 'fail'">配置读取失败（见下方错误）</template>
             <template v-else>正在读取配置…</template>
             <button
               class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary"
