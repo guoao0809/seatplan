@@ -750,18 +750,19 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             v-model="aiPrompt"
             rows="5"
             placeholder="描述你想要的排座方式…"
-            class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
+            :disabled="aiBusy"
+            class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
           ></textarea>
           <div class="flex items-center gap-2 text-xs text-muted">
             <template v-if="aiConfigStatus === 'fail'">配置读取失败，见下方错误</template>
             <template v-else-if="aiConfigStatus === 'loading'">正在读取配置…</template>
-            <button
+            <!-- <button
               class="rounded border border-border px-2 py-0.5 hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border disabled:hover:text-current"
               :disabled="aiBusy"
               @click="openAi"
             >
               重新读取
-            </button>
+            </button> -->
           </div>
           <div
             v-if="aiError"
@@ -825,7 +826,8 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             v-model="aiFollowUp"
             rows="2"
             placeholder="不满意？继续提要求后点重排，例如：第三组后排的同学换到前排"
-            class="h-16 min-w-0 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
+            :disabled="aiBusy"
+            class="h-16 min-w-0 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
           ></textarea>
           <button
             class="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90 disabled:opacity-50"

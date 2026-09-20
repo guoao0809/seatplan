@@ -17,6 +17,20 @@ pub struct AiConfig {
     pub model: String,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 推理强度。不填默认 "none"（关掉思考）：实测排座从 53s 降到 7s，结果同样通过校验。
+    /// 填 "off" 则完全不发该参数（网关不认 reasoning_effort 时用）；也可填 low / medium / high。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// 解析要发给网关的 reasoning_effort。
+/// None（未配置）→ "none"；Some("off") → 不发该参数；其余原样透传。
+fn reasoning_effort(config: &AiConfig) -> Option<&str> {
+    match config.reasoning_effort.as_deref() {
+        Some("off") => None,
+        Some(v) => Some(v),
+        None => Some("none"),
+    }
 }
 
 /// 一条对话消息。字段名本就是单词小写，无需 rename。
@@ -103,12 +117,15 @@ pub async fn ai_arrange(config: AiConfig, messages: Vec<ChatMessage>) -> Result<
         }
 
         let url = request_url(&config.base_url);
-        let body = json!({
+        let mut body = json!({
             "model": config.model,
             "messages": messages,
             "temperature": config.temperature.unwrap_or(0.7),
             "stream": false
         });
+        if let Some(effort) = reasoning_effort(&config) {
+            body["reasoning_effort"] = json!(effort);
+        }
 
         let text = post_json(&url, &config, &body)?;
         extract_text(&text)
@@ -163,5 +180,30 @@ mod tests {
             serde_json::from_str(r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m"}"#).unwrap();
         assert_eq!(c.model, "m");
         assert!(c.temperature.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_to_none() {
+        let c: AiConfig =
+            serde_json::from_str(r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m"}"#).unwrap();
+        assert_eq!(reasoning_effort(&c), Some("none"));
+    }
+
+    #[test]
+    fn reasoning_effort_off_omits_the_param() {
+        let c: AiConfig = serde_json::from_str(
+            r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m","reasoningEffort":"off"}"#,
+        )
+        .unwrap();
+        assert_eq!(reasoning_effort(&c), None);
+    }
+
+    #[test]
+    fn reasoning_effort_passes_through_explicit_values() {
+        let c: AiConfig = serde_json::from_str(
+            r#"{"baseUrl":"http://x/v1","apiKey":"k","model":"m","reasoningEffort":"high"}"#,
+        )
+        .unwrap();
+        assert_eq!(reasoning_effort(&c), Some("high"));
     }
 }

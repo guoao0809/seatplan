@@ -7,6 +7,8 @@ export interface AiConfig {
   apiKey: string;
   model: string;
   temperature?: number;
+  /** 推理强度：不填默认 none（关掉思考，实测 53s→7s）；"off" 表示完全不发该参数 */
+  reasoningEffort?: string;
 }
 
 /** Rust load_ai_config 的返回 */

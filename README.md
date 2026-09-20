@@ -57,12 +57,14 @@ pnpm tauri build    # 打包为安装程序（产物在 src-tauri/target/release
   "baseUrl": "https://api.deepseek.com/v1",
   "apiKey": "sk-your-key",
   "model": "deepseek-v4-pro",
-  "temperature": 0.7
+  "temperature": 0.7,
+  "reasoningEffort": "none"
 }
 ```
 
 - `baseUrl` 不写 `/v1` 也可以，程序会自动补上；DeepSeek、通义、智谱、Kimi、OpenAI 的官方地址同样适用
 - `temperature` 可省略，默认 `0.7`
+- `reasoningEffort` 控制推理强度。**不填默认 `none`（关掉思考）**——排座只是把姓名重排一遍，不需要深度推理；实测同一网关下从 53 秒降到 7 秒，排出的座位同样通过校验。想恢复思考填 `low` / `medium` / `high`；若你的网关不认这个参数而报 400，填 `off` 让程序完全不发送它
 - 该文件已被 `.gitignore` 忽略（含明文密钥，**不要提交**）
 
 找不到或格式错误时，AI 弹窗会直接显示实际查找过的路径。
