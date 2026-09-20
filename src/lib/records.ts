@@ -4,6 +4,8 @@ export interface SeatRecord {
   id: string;
   exportedAt: number;
   rows: number[];
+  /** 各组配色；早期记录没有此字段，回退默认调色板 */
+  colors?: string[];
   seatsPerRow: number;
   singleSeatName: string;
   /** 座位网格（组 → 排 → 座 → 姓名或 null） */
@@ -11,7 +13,10 @@ export interface SeatRecord {
 }
 
 /** 回显到排座页所需的数据子集 */
-export type RestorePayload = Pick<SeatRecord, "rows" | "seatsPerRow" | "singleSeatName" | "grid">;
+export type RestorePayload = Pick<
+  SeatRecord,
+  "rows" | "colors" | "seatsPerRow" | "singleSeatName" | "grid"
+>;
 
 export const LS_RECORDS = "seatplan:records";
 

@@ -18,8 +18,45 @@ export const DEFAULT_ROSTER = [
 
 /** 每排座位数（默认两人一桌） */
 export const DEFAULT_SEATS_PER_ROW = 2;
-/** 各组排数 */
+/** 默认各组排数（也是老配置迁移时的兜底） */
 export const DEFAULT_ROWS_PER_GROUP = [7, 7, 8, 8];
+
+/**
+ * 组配色表。整体取中深色调，使白字在每一组上都可读——保持「白字 + 彩底」的观感统一，
+ * 而不是每组自动换字色导致深浅不一。用户自己选到浅色时由 readableText 兜底。
+ * 刻意把天蓝排在第 8 位——它和「单座」的颜色接近，组少时就不会撞色。
+ */
+export const GROUP_COLORS = [
+  "#6BA24C", // 草绿
+  "#D08A2A", // 琥珀
+  "#6B7FCC", // 靛蓝
+  "#D2604A", // 珊瑚
+  "#2F9A8B", // 青碧
+  "#9668B5", // 紫罗兰
+  "#A07828", // 金
+  "#3D82BE", // 天蓝
+];
+
+/** 按序号取配色，组数超过调色板长度时循环 */
+export function paletteColor(index: number): string {
+  return GROUP_COLORS[index % GROUP_COLORS.length]!;
+}
+
+/** 一组（一列）的配置：排数 + 配色 */
+export interface GroupConfig {
+  rows: number;
+  color: string;
+}
+
+/** 由排数数组补上配色，得到完整配置（默认值、老配置迁移、恢复记录都走这里） */
+export function toGroupConfigs(rows: number[], colors?: string[]): GroupConfig[] {
+  return rows.map((r, i) => ({ rows: r, color: colors?.[i] ?? paletteColor(i) }));
+}
+
+/** 默认配置（首次打开 / 配置损坏时用） */
+export function defaultGroupConfigs(): GroupConfig[] {
+  return toGroupConfigs(DEFAULT_ROWS_PER_GROUP);
+}
 
 const CN_NUM = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
 
@@ -41,13 +78,32 @@ export function parseRoster(text: string): string[] {
     .filter(Boolean);
 }
 
-/** 解析每组排数配置：如 "7,7,8,8"，非法项会被过滤；结果为空则回退默认 */
+/** 解析旧版「每组排数」文本（如 "7,7,8,8"）。仅用于迁移老配置，新配置已改为表格。 */
 export function parseRows(text: string): number[] {
   const nums = text
     .split(/[,，、;\s]+/)
     .map((s) => parseInt(s, 10))
     .filter((n) => Number.isInteger(n) && n > 0);
   return nums.length > 0 ? nums : DEFAULT_ROWS_PER_GROUP;
+}
+
+/**
+ * 依据背景色亮度选深字或白字，保证用户自选的任意配色都读得清。
+ * 用 sRGB 感知亮度近似（0.299R + 0.587G + 0.114B），阈值 0.62。
+ */
+export function readableText(hex: string): string {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (!m) return "#ffffff";
+  const n = parseInt(m[1]!, 16);
+  const lum = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.62 ? "#111827" : "#ffffff";
+}
+
+/** 校验一个 hex 颜色；非法则回退到给定序号的标准配色 */
+export function safeColor(value: unknown, index: number): string {
+  return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value.trim())
+    ? value.trim()
+    : paletteColor(index);
 }
 
 export interface Seat {
@@ -58,6 +114,8 @@ export interface SeatRow {
 }
 export interface Group {
   label: string;
+  /** 该组配色（hex） */
+  color: string;
   rows: SeatRow[];
 }
 
@@ -76,14 +134,15 @@ export function groupLabel(index: number, total: number, reverse: boolean): stri
  */
 export function assignSeats(
   roster: string[],
-  rowsPerGroup: number[],
+  groups: GroupConfig[],
   seatsPerRow: number,
   reverse = false,
 ): Group[] {
   let idx = 0;
-  return rowsPerGroup.map((rowCount, gi) => ({
-    label: groupLabel(gi, rowsPerGroup.length, reverse),
-    rows: Array.from({ length: rowCount }, () => ({
+  return groups.map((cfg, gi) => ({
+    label: groupLabel(gi, groups.length, reverse),
+    color: cfg.color,
+    rows: Array.from({ length: cfg.rows }, () => ({
       seats: Array.from({ length: seatsPerRow }, () => {
         const name = roster[idx++] ?? null;
         return { name };
@@ -94,7 +153,8 @@ export function assignSeats(
 
 /** 自检：默认名单应恰好铺满默认网格（60 人 = (7+7+8+8)×2 座），失败即抛错。 */
 export function runSelfCheck(): void {
-  const groups = assignSeats(DEFAULT_ROSTER, DEFAULT_ROWS_PER_GROUP, DEFAULT_SEATS_PER_ROW);
+  const cfgs = defaultGroupConfigs();
+  const groups = assignSeats(DEFAULT_ROSTER, cfgs, DEFAULT_SEATS_PER_ROW);
   const capacity = DEFAULT_ROWS_PER_GROUP.reduce((n, r) => n + r) * DEFAULT_SEATS_PER_ROW;
   const placed = groups.flatMap((g) => g.rows.flatMap((r) => r.seats)).filter((s) => s.name);
   if (DEFAULT_ROSTER.length !== capacity)
@@ -110,6 +170,40 @@ export function runSelfCheck(): void {
   if (groups.map((_, i) => groupLabel(i, 4, true)).join() !== rev.join())
     throw new Error(`反向组名应为 ${rev.join()}，实际 ${groups.map((_, i) => groupLabel(i, 4, true)).join()}`);
   if (groupLabel(0, 4, false) !== "第一组") throw new Error("正向组名应为「第一组」");
+
+  // 配色：默认四组必须各不相同，且都带上了
+  const colors = groups.map((g) => g.color);
+  if (new Set(colors).size !== colors.length)
+    throw new Error(`默认各组配色应互不相同，实际 ${colors.join(",")}`);
+  if (colors.some((c) => !/^#[0-9a-f]{6}$/i.test(c)))
+    throw new Error(`配色应为 6 位 hex，实际 ${colors.join(",")}`);
+
+  // 组数超过调色板长度时循环取用，且不能取到 undefined
+  const many = assignSeats([], toGroupConfigs(Array.from({ length: GROUP_COLORS.length + 3 }, () => 1)), 1);
+  if (many.some((g) => !g.color))
+    throw new Error("组数超过调色板长度时应循环取色，不能为空");
+
+  // 迁移：只给排数时自动补默认配色
+  const migrated = toGroupConfigs([3, 4]);
+  if (migrated[0]!.color !== paletteColor(0) || migrated[1]!.color !== paletteColor(1))
+    throw new Error("toGroupConfigs 未按序号补默认配色");
+  if (toGroupConfigs([3], ["#ABCDEF"])[0]!.color !== "#ABCDEF")
+    throw new Error("toGroupConfigs 应保留已给配色");
+
+  // 可读文字色：浅底给深字、深底给白字、非法值回退白字
+  if (readableText("#FFFFFF") !== "#111827") throw new Error("白底应配深字");
+  if (readableText("#000000") !== "#ffffff") throw new Error("黑底应配白字");
+  if (readableText("不是颜色") !== "#ffffff") throw new Error("非法颜色应回退白字");
+  // 整个调色板都必须配白字，否则各组字色深浅不一，观感割裂
+  for (const c of GROUP_COLORS) {
+    if (readableText(c) !== "#ffffff")
+      throw new Error(`调色板颜色 ${c} 应配白字（当前会配深字），说明它偏亮、需压深`);
+  }
+
+  // safeColor：非法值回退到该序号的标准配色
+  if (safeColor("red", 2) !== paletteColor(2)) throw new Error("safeColor 应拒绝非 hex 值");
+  if (safeColor(undefined, 1) !== paletteColor(1)) throw new Error("safeColor 应处理 undefined");
+  if (safeColor("#AABBCC", 0) !== "#AABBCC") throw new Error("safeColor 应保留合法值");
 }
 
 // 自检也可用 node 直接跑：`node --experimental-strip-types src/lib/seat.ts`

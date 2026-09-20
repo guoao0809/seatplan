@@ -23,6 +23,7 @@ function remove(id: string) {
 function restore(r: SeatRecord) {
   emit("restore", {
     rows: r.rows,
+    colors: r.colors,
     seatsPerRow: r.seatsPerRow,
     singleSeatName: r.singleSeatName,
     grid: r.grid,

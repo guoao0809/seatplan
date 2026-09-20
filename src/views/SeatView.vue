@@ -11,20 +11,27 @@ import {
   GraduationCap,
   Sparkles,
   LoaderCircle,
+  Plus,
+  Trash2,
 } from "lucide-vue-next";
 import { toPng } from "html-to-image";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
   DEFAULT_ROSTER,
-  DEFAULT_ROWS_PER_GROUP,
   DEFAULT_SEATS_PER_ROW,
   assignSeats,
   parseRoster,
   parseRows,
   runSelfCheck,
   groupLabel,
+  defaultGroupConfigs,
+  toGroupConfigs,
+  paletteColor,
+  safeColor,
+  readableText,
   type Group,
+  type GroupConfig,
 } from "../lib/seat";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
 import {
@@ -50,7 +57,8 @@ const LS_GRID = "seatplan:grid";
 // 名单文本与配置
 const rosterText = ref(DEFAULT_ROSTER.join("\n"));
 const seatsPerRow = ref(DEFAULT_SEATS_PER_ROW);
-const rowsText = ref(DEFAULT_ROWS_PER_GROUP.join(","));
+// 各组配置：排数 + 配色（配置弹窗里以表格编辑）
+const groupCfgs = ref<GroupConfig[]>(defaultGroupConfigs());
 const singleSeatName = ref("");
 // 组号从右往左数（最右为第一组）
 const reverseGroups = ref(false);
@@ -93,10 +101,20 @@ function currentGrid(): (string | null)[][][] {
 }
 
 const nameCount = computed(() => parseRoster(rosterText.value).length);
-const rows = computed(() => parseRows(rowsText.value));
+const rows = computed(() => groupCfgs.value.map((c) => c.rows));
 const seatCount = computed(() => Math.max(1, Number(seatsPerRow.value) || 1));
 const capacity = computed(() => rows.value.reduce((n, r) => n + r) * seatCount.value);
 const groupCount = computed(() => rows.value.length);
+
+/** 某组的配色；组被删到越界时回退到该序号的标准色，避免渲染出无色座位 */
+function groupColor(gi: number): string {
+  return seatGrid.value[gi]?.color ?? paletteColor(gi);
+}
+
+/** 该座位是否已坐人（座位按组配色，空位保持中性虚线格） */
+function seatStyle(g: Group, hasName: boolean) {
+  return hasName ? { backgroundColor: g.color, color: readableText(g.color) } : {};
+}
 
 // 可拖拽的座位网格：名单+配置是种子，拖拽可交换座位姓名
 const seatGrid = ref<Group[]>([]);
@@ -132,7 +150,7 @@ function persistGrid() {
 function seedGrid() {
   seatGrid.value = assignSeats(
     parseRoster(rosterText.value),
-    rows.value,
+    groupCfgs.value,
     seatCount.value,
     reverseGroups.value,
   );
@@ -147,6 +165,7 @@ function applySavedGrid() {
     if (Array.isArray(names)) {
       seatGrid.value = names.map((rowArr, gi) => ({
         label: groupLabel(gi, names.length, reverseGroups.value),
+        color: groupColor(gi),
         rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
       }));
       persistGrid();
@@ -337,6 +356,7 @@ function applyAi() {
   if (!g) return;
   seatGrid.value = g.map((rowsArr, gi) => ({
     label: groupLabel(gi, g.length, reverseGroups.value),
+    color: groupColor(gi),
     rows: rowsArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
   }));
   persistGrid();
@@ -366,10 +386,12 @@ function applyRestore(p: RestorePayload) {
   const flat = p.grid.flatMap((rows) => rows.flatMap((s) => s));
   rosterText.value = flat.filter((n) => n !== null).join("\n");
   seatsPerRow.value = p.seatsPerRow;
-  rowsText.value = p.rows.join(",");
+  // 早期记录没有 colors，回退到默认调色板
+  groupCfgs.value = toGroupConfigs(p.rows, p.colors);
   singleSeatName.value = p.singleSeatName || "";
   seatGrid.value = p.grid.map((rowArr, gi) => ({
     label: groupLabel(gi, p.grid.length, reverseGroups.value),
+    color: groupColor(gi),
     rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
   }));
   persistGrid();
@@ -419,6 +441,7 @@ async function exportImage() {
       id: `rec-${Date.now()}`,
       exportedAt: Date.now(),
       rows: rows.value,
+      colors: groupCfgs.value.map((c) => c.color),
       seatsPerRow: seatCount.value,
       singleSeatName: singleSeatName.value,
       grid: seatGrid.value.map((g) => g.rows.map((row) => row.seats.map((s) => s.name))),
@@ -436,6 +459,16 @@ async function exportImage() {
 // 名单/配置变化时重铺网格；拖拽只改网格、不触发重铺
 // suppressSeed：挂载/回显期间为 true，避免名称或配置赋值触发的监听覆盖已还原的网格
 let suppressSeed = true;
+// 配置弹窗里改排数/配色时，只更新已有网格的配色，不重铺（否则会丢掉拖拽结果与 AI 排座结果）
+watch(
+  () => groupCfgs.value.map((c) => c.color).join(","),
+  () => {
+    if (suppressSeed) return;
+    seatGrid.value.forEach((g, gi) => {
+      if (groupCfgs.value[gi]) g.color = groupCfgs.value[gi]!.color;
+    });
+  },
+);
 watch([rosterText, rows, seatCount], () => {
   if (suppressSeed) return;
   seedGrid();
@@ -453,10 +486,21 @@ onMounted(() => {
     try {
       const c = JSON.parse(cfg);
       if (c.seatsPerRow) seatsPerRow.value = c.seatsPerRow;
-      if (c.rowsText) rowsText.value = c.rowsText;
       if (typeof c.singleSeatName === "string") singleSeatName.value = c.singleSeatName;
       if (typeof c.reverseGroups === "boolean") reverseGroups.value = c.reverseGroups;
       if (typeof c.teacherView === "boolean") teacherView.value = c.teacherView;
+      // 新结构：groups = [{rows, color}]；老配置只有 rowsText 字符串，迁移过来
+      if (Array.isArray(c.groups)) {
+        const list = (c.groups as { rows?: unknown; color?: unknown }[])
+          .map((g, i) => ({
+            rows: Math.max(1, Math.floor(Number(g?.rows)) || 1),
+            color: safeColor(g?.color, i),
+          }))
+          .filter((g) => Number.isFinite(g.rows));
+        if (list.length > 0) groupCfgs.value = list;
+      } else if (typeof c.rowsText === "string") {
+        groupCfgs.value = toGroupConfigs(parseRows(c.rowsText));
+      }
     } catch {
       /* 配置损坏则忽略，用默认 */
     }
@@ -480,19 +524,46 @@ onBeforeUnmount(() => {
   window.removeEventListener("pointerup", onPointerUp);
 });
 
-watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
-  localStorage.setItem(LS_ROSTER, rosterText.value);
-  localStorage.setItem(
-    LS_CFG,
-    JSON.stringify({
-      seatsPerRow: seatsPerRow.value,
-      rowsText: rowsText.value,
-      singleSeatName: singleSeatName.value,
-      reverseGroups: reverseGroups.value,
-      teacherView: teacherView.value,
-    }),
-  );
-});
+watch(
+  () => JSON.stringify([rosterText.value, seatsPerRow.value, groupCfgs.value, singleSeatName.value, teacherView.value]),
+  () => {
+    localStorage.setItem(LS_ROSTER, rosterText.value);
+    localStorage.setItem(
+      LS_CFG,
+      JSON.stringify({
+        seatsPerRow: seatsPerRow.value,
+        groups: groupCfgs.value,
+        singleSeatName: singleSeatName.value,
+        reverseGroups: reverseGroups.value,
+        teacherView: teacherView.value,
+      }),
+    );
+  },
+);
+
+// ===== 配置弹窗：组的增删改 =====
+
+/** 新增一组：排数沿用最后一组，配色取调色板下一个 */
+function addGroup() {
+  const last = groupCfgs.value[groupCfgs.value.length - 1];
+  groupCfgs.value = [
+    ...groupCfgs.value,
+    { rows: last?.rows ?? 7, color: paletteColor(groupCfgs.value.length) },
+  ];
+}
+/** 删除一组；至少保留一组 */
+function removeGroup(index: number) {
+  if (groupCfgs.value.length <= 1) {
+    showToast("至少要保留一组", "info");
+    return;
+  }
+  groupCfgs.value = groupCfgs.value.filter((_, i) => i !== index);
+}
+/** 改排数：允许中途为空，提交时收敛到 ≥1 的整数 */
+function setGroupRows(index: number, value: string) {
+  const n = Math.floor(Number(value));
+  groupCfgs.value[index]!.rows = Number.isFinite(n) && n >= 1 ? n : 1;
+}
 </script>
 
 <template>
@@ -600,15 +671,16 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
                     :data-seat="seatKey(gi, ri, si)"
                     :class="[
                       isDragSource(gi, ri, si)
-                        ? 'bg-[#4E7A3A] text-white opacity-60'
+                        ? 'opacity-50 ring-2 ring-primary'
                         : seat.name
-                          ? 'bg-[#86C166] text-white'
+                          ? ''
                           : 'bg-surface border border-dashed border-border text-muted',
                       dragOverKey === seatKey(gi, ri, si) ? 'ring-2 ring-primary' : '',
                       teacherView ? 'rotate-180' : '',
                       swapKeys.includes(seatKey(gi, ri, si)) ? 'seat-swapping' : '',
                     ]"
                     class="flex h-14 w-24 cursor-grab select-none items-center justify-center rounded-lg text-sm font-medium"
+                    :style="seatStyle(g, !!seat.name)"
                     @pointerdown="onSeatPointerDown($event, gi, ri, si)"
                   >
                     {{ seat.name || "—" }}
@@ -698,7 +770,7 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
       @click.self="showConfig = false"
     >
-      <div class="flex w-90 flex-col rounded-xl bg-panel shadow-2xl">
+      <div class="flex w-105 flex-col rounded-xl bg-panel shadow-2xl">
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">配置</span>
           <button
@@ -708,7 +780,7 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
             <X :size="16" />
           </button>
         </div>
-        <div class="flex flex-col gap-4 p-5">
+        <div class="flex min-h-0 flex-col gap-4 overflow-y-auto p-5">
           <div>
             <label class="text-xs text-text">每排座位数</label>
             <input
@@ -718,14 +790,63 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
               class="mt-1 w-full rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
             />
           </div>
+
+          <!-- 组：排数 + 配色，可增删 -->
           <div>
-            <label class="text-xs text-text">每组排数（逗号分隔）</label>
-            <input
-              v-model="rowsText"
-              placeholder="7,7,8,8"
-              class="mt-1 w-full rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
-            />
+            <div class="mb-1.5 flex items-center justify-between">
+              <label class="text-xs text-text">组别（排数与配色）</label>
+              <button
+                class="flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs text-text hover:border-primary hover:text-primary"
+                @click="addGroup"
+              >
+                <Plus :size="12" />
+                新增组
+              </button>
+            </div>
+            <div class="overflow-hidden rounded-lg border border-border">
+              <div
+                class="flex items-center gap-2 border-b border-border bg-surface px-2.5 py-1.5 text-xs text-muted"
+              >
+                <span class="w-16">组别</span>
+                <span class="flex-1">排数</span>
+                <span class="w-16 text-center">配色</span>
+                <span class="w-6"></span>
+              </div>
+              <div
+                v-for="(g, gi) in groupCfgs"
+                :key="gi"
+                class="flex items-center gap-2 border-b border-border px-2.5 py-1.5 last:border-b-0"
+              >
+                <span class="w-16 shrink-0 text-xs text-text">
+                  {{ groupLabel(gi, groupCfgs.length, reverseGroups) }}
+                </span>
+                <input
+                  :value="g.rows"
+                  type="number"
+                  min="1"
+                  class="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1 text-sm text-title outline-none focus:border-primary"
+                  @input="setGroupRows(gi, ($event.target as HTMLInputElement).value)"
+                />
+                <input
+                  v-model="g.color"
+                  type="color"
+                  title="该组配色"
+                  class="h-7 w-16 shrink-0 cursor-pointer rounded-md border border-border bg-surface p-0.5"
+                />
+                <button
+                  class="flex w-6 shrink-0 justify-center rounded p-0.5 text-muted hover:bg-surface hover:text-red-500"
+                  title="删除该组"
+                  @click="removeGroup(gi)"
+                >
+                  <Trash2 :size="13" />
+                </button>
+              </div>
+            </div>
+            <p class="mt-1.5 text-xs leading-relaxed text-muted">
+              座位文字颜色会按底色明暗自动取深/浅，保证看得清。
+            </p>
           </div>
+
           <div>
             <label class="text-xs text-text">单座学生姓名</label>
             <input
@@ -814,11 +935,10 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
                       :key="si"
                       class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
                       :class="[
-                        name
-                          ? 'bg-[#86C166] text-white'
-                          : 'bg-surface border border-dashed border-border text-muted',
+                        name ? '' : 'bg-surface border border-dashed border-border text-muted',
                         teacherView ? 'rotate-180' : '',
                       ]"
+                      :style="name ? { backgroundColor: groupColor(gi), color: readableText(groupColor(gi)) } : {}"
                     >
                       {{ name || "—" }}
                     </div>
