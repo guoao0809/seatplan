@@ -221,6 +221,8 @@ export function runAiSelfCheck(): void {
       ],
       false,
     ],
+    ["座位值类型", [[[1, "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]], false],
+    ["座位值是数组", [[[["甲"], "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]], false],
     ["不是数组", { a: 1 }, false],
   ];
 
@@ -233,6 +235,16 @@ export function runAiSelfCheck(): void {
       );
     }
   }
+
+  // 座位值类型非法必须被类型检查直接点名（不能只靠后面的姓名比对兜底）
+  const typeReason = validateGrid(
+    [[[1, "乙"], ["丙", "丁"]], [["戊", "己"], ["庚", "辛"]]],
+    rows,
+    seatsPerRow,
+    expected,
+  );
+  if (typeReason === null || !typeReason.includes("座位值只能是姓名或 null"))
+    throw new Error(`座位值类型非法应由类型检查拒绝，实际：${typeReason}`);
 
   // 展平
   if (flattenNames(good).length !== 8) throw new Error("flattenNames 应取到 8 个姓名");
@@ -247,6 +259,22 @@ export function runAiSelfCheck(): void {
   extra[1]![1]![1] = "壬";
   if (validateGrid(extra, rows, seatsPerRow, expected) === null)
     throw new Error("多出未在名单中的姓名应被拒绝");
+
+  // 同时缺名与多名：理由里必须同时点出「少了」和「多了」
+  const swap = JSON.parse(JSON.stringify(good)) as (string | null)[][][];
+  swap[0]![0]![1] = "壬";
+  const swapReason = validateGrid(swap, rows, seatsPerRow, expected);
+  if (swapReason === null) throw new Error("少一个又多一个的网格应被拒绝");
+  if (!swapReason.includes("少了") || !swapReason.includes("多了"))
+    throw new Error(`理由应同时包含「少了」与「多了」，实际：${swapReason}`);
+
+  // 非 JSON 文本必须被拒，而不是抛异常
+  const bad = parseArrangement("这不是 JSON", rows, seatsPerRow, expected);
+  if (bad.ok) throw new Error("非 JSON 文本应被拒绝");
+
+  // 维度不符时也应走 ok:false，而不是抛异常
+  const wrongShape = parseArrangement(JSON.stringify([good[0]]), rows, seatsPerRow, expected);
+  if (wrongShape.ok) throw new Error("组数不符的返回应被拒绝");
 }
 
 // ===== 与 Rust 通信（动态 import，保持本文件可独立自检）=====
