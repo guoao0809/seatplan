@@ -77,32 +77,38 @@ fn extract_text(body: &str) -> Result<String, String> {
         })
 }
 
-/// 调 AI 排座，返回模型输出的原始文本（解析与校验交给前端）
+/// 调 AI 排座，返回模型输出的原始文本（解析与校验交给前端）。
+/// async + spawn_blocking：Tauri 2 非 async 命令跑在主线程，阻塞式 reqwest 会冻住 UI，
+/// 因此把整个阻塞过程丢到线程池执行。
 #[tauri::command]
-pub fn ai_arrange(config: AiConfig, system: String, user: String) -> Result<String, String> {
-    if config.base_url.trim().is_empty() {
-        return Err("配置里的 baseUrl 为空".into());
-    }
-    if config.api_key.trim().is_empty() {
-        return Err("配置里的 apiKey 为空".into());
-    }
-    if config.model.trim().is_empty() {
-        return Err("配置里的 model 为空".into());
-    }
+pub async fn ai_arrange(config: AiConfig, system: String, user: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if config.base_url.trim().is_empty() {
+            return Err("配置里的 baseUrl 为空".into());
+        }
+        if config.api_key.trim().is_empty() {
+            return Err("配置里的 apiKey 为空".into());
+        }
+        if config.model.trim().is_empty() {
+            return Err("配置里的 model 为空".into());
+        }
 
-    let url = request_url(&config.base_url);
-    let body = json!({
-        "model": config.model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ],
-        "temperature": config.temperature.unwrap_or(0.7),
-        "stream": false
-    });
+        let url = request_url(&config.base_url);
+        let body = json!({
+            "model": config.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ],
+            "temperature": config.temperature.unwrap_or(0.7),
+            "stream": false
+        });
 
-    let text = post_json(&url, &config, &body)?;
-    extract_text(&text)
+        let text = post_json(&url, &config, &body)?;
+        extract_text(&text)
+    })
+    .await
+    .map_err(|e| format!("排座任务执行失败：{e}"))?
 }
 
 #[cfg(test)]
