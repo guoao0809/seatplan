@@ -22,10 +22,13 @@ jobs:
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
 
+      # 必须 ≥ 22.13：package.json 里 packageManager 是 pnpm@11，
+      # pnpm 11 用了 Node 22.5+ 才有的内置模块 node:sqlite，Node 20 会直接报错。
+      # 与本地开发环境（Node 24）保持一致，避免「本地能跑、CI 挂掉」。
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: 安装 Rust

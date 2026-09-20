@@ -46,7 +46,9 @@
 
 ## 开发
 
-需要 [Node.js](https://nodejs.org/) ≥ 20、[pnpm](https://pnpm.io/)、[Rust](https://rustup.rs/)。
+需要 [Node.js](https://nodejs.org/) **≥ 22.13**、[pnpm](https://pnpm.io/) 11、[Rust](https://rustup.rs/)。
+
+> Node 版本不能低于 22.13：`pnpm@11` 依赖 Node 22.5+ 的内置模块 `node:sqlite`，低版本会在 `pnpm install` 直接报 `No such built-in module: node:sqlite`。
 
 ```bash
 pnpm install        # 安装依赖
