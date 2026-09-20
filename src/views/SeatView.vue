@@ -728,7 +728,10 @@ watch([rosterText, seatsPerRow, rowsText, singleSeatName, teacherView], () => {
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
       @click.self="closeAi"
     >
-      <div class="flex max-h-[88vh] w-[94vw] max-w-280 flex-col rounded-xl bg-panel shadow-2xl">
+      <div
+        class="flex max-h-[88vh] w-[94vw] flex-col rounded-xl bg-panel shadow-2xl"
+        :class="aiPreview ? 'max-w-280' : 'max-w-140'"
+      >
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">
             {{ aiPreview ? "AI 排座结果预览" : "AI 排座" }}
