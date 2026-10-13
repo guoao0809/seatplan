@@ -126,6 +126,24 @@ export function runRotationSelfCheck(): void {
   );
   const empty: Grid = [[[null, null]]];
   must(deskmateConflicts(empty, [["张三", "李四"]]).length === 0, "空位不该算冲突");
+
+  // 尾随标点 / 顿号 / 换行 / 散文混进名字段：都不能让硬约束凭空消失
+  must(
+    parseNoDeskmate("不能同桌:张三，李四。").join() === "张三,李四",
+    `句末句号不该进名字，实际 ${parseNoDeskmate("不能同桌:张三，李四。").join()}`,
+  );
+  must(parseNoDeskmate("不能同桌:张三、李四").join() === "张三,李四", "顿号应作分隔符");
+  must(parseNoDeskmate("不能同桌:张三\n别的备注").join() === "张三", "换行应终止名字段");
+  const proseNote = noDeskmatePairs([
+    { name: "张三", note: "不能同桌:李四，喜欢靠窗" },
+    { name: "李四" },
+  ]);
+  must(
+    proseNote.length === 1 && proseNote[0]!.join() === "张三,李四",
+    `散文「喜欢靠窗」不该成为幽灵约束，实际 ${JSON.stringify(proseNote)}`,
+  );
+  // 对外 API 不该要求调用方先归一顺序
+  must(deskmateConflicts(desk, [["李四", "张三"]]).length === 1, "对子顺序反过来也要能查到");
 }
 
 // 自检也可用 node 直接跑
@@ -146,14 +164,19 @@ Expected: 抛出 `应解析出张三,李四，实际 `（断言失败），说�
 替换上面三个函数的函数体：
 
 ```ts
-/** 备注里「不能同桌」后面的名字段 */
-const NO_DESK_RE = /不能同桌\s*[:：]\s*([^;；\n]*)/g;
+/**
+ * 备注里「不能同桌」后面的名字段。遇到分号 / 换行 / 句末标点即认为该段结束——
+ * 只认分号和换行的话，「不能同桌:张三，李四。」会把句号吞进名字，
+ * 于是这条硬约束永远匹配不上，静默失效。
+ */
+const NO_DESK_RE = /不能同桌\s*[:：]\s*([^;；。！？!?\n]*)/g;
 
 export function parseNoDeskmate(note: string): string[] {
   const out: string[] = [];
   for (const m of note.matchAll(NO_DESK_RE)) {
     for (const raw of (m[1] ?? "").split(/[,，、;；\s]+/)) {
-      const name = raw.trim();
+      // 名字可能带着尾随标点，先剪掉再判断
+      const name = raw.trim().replace(/[。！？!?、，,;；.]+$/u, "").trim();
       if (name && !out.includes(name)) out.push(name);
     }
   }
@@ -161,12 +184,15 @@ export function parseNoDeskmate(note: string): string[] {
 }
 
 export function noDeskmatePairs(students: RosterStudent[]): [string, string][] {
+  // 只认名单里真实存在的人：备注若写成「不能同桌:李四，喜欢靠窗」，
+  // 按分隔符会切出「喜欢靠窗」这种散文片段，不对照名单就会留下一条永远匹配不上的幽灵约束
+  const known = new Set(students.map((s) => s.name.trim()).filter(Boolean));
   const pairs = new Map<string, [string, string]>();
   for (const s of students) {
     const me = s.name.trim();
     if (!me) continue;
     for (const other of parseNoDeskmate(s.note ?? "")) {
-      if (!other || other === me) continue; // 写自己没意义
+      if (other === me || !known.has(other)) continue; // 写自己、或不是本班学生 → 忽略
       // 字母序归一：单向声明即对称，同一对不重复入表
       const [a, b] = me < other ? [me, other] : [other, me];
       pairs.set(`${a}|${b}`, [a, b]);
@@ -176,7 +202,14 @@ export function noDeskmatePairs(students: RosterStudent[]): [string, string][] {
 }
 
 export function deskmateConflicts(grid: Grid, pairs: [string, string][]): [string, string][] {
-  const wanted = new Set(pairs.map(([a, b]) => `${a}|${b}`));
+  // 自己归一顺序，不依赖调用方先归一过
+  const wanted = new Set(
+    pairs.map(([x, y]) => {
+      const a = x.trim();
+      const b = y.trim();
+      return a < b ? `${a}|${b}` : `${b}|${a}`;
+    }),
+  );
   const hit: [string, string][] = [];
   for (const desk of deskPairsOf(grid)) {
     const names = desk.students.map((s) => s?.name?.trim() ?? "");
@@ -224,56 +257,69 @@ git commit -m "feat(rotation): 不能同桌硬约束的解析与逐轮冲突检�
 在 `runRotationSelfCheck()` 的末尾（`}` 之前）追加：
 
 ```ts
-  // 公平统计：1 组 2 排 2 座。排 0 = 前排，排 1 = 后排（按排数三等分）
-  const four: Grid[] = [
-    [
-      ["甲", "乙"],
-      ["丙", "丁"],
-    ],
-  ];
-  const stat = roundStatsOf(four, [{ name: "甲" }, { name: "丙" }]);
+  // 公平统计：1 组 2 排 2 座。排 0 = 前排、排 1 = 后排（按排数三等分；2 排的教室没有中排）
+  // 嵌套层级注意：Grid = 组→排→座（三层），Grid[] = 轮→组→排→座（四层）
+  const one: Grid = [[["甲", "乙"], ["丙", "丁"]]];
+  const stat = roundStatsOf([one], [{ name: "甲" }, { name: "丙" }]);
   must(stat.length === 2, `只统计名单里出现的名字，实际 ${stat.length}`);
   const jia = stat.find((s) => s.name === "甲")!;
-  must(jia.front === 1 && jia.back === 0, ` 甲 应前排 1 次后排 0 次，实际 ${JSON.stringify(jia)}`);
-  must(jia.left === 1 && jia.right === 0, ` 甲 应左 1 右 0，实际 ${JSON.stringify(jia)}`);
+  must(jia.front === 1 && jia.back === 0, `甲应前排 1 次后排 0 次，实际 ${JSON.stringify(jia)}`);
+  must(jia.left === 1 && jia.right === 0, `甲应左 1 右 0，实际 ${JSON.stringify(jia)}`);
 
-  // 四轮全轮换 → 每人都坐过前后左右，没有 gap
+  // 两轮之间整排对调 → 每人前后排各坐一次；且 2 排教室里「中排」不存在，不该被标轮空
   const rotated: Grid[] = [
-    [
-      ["甲", "乙"],
-      ["丙", "丁"],
-    ],
-    [
-      ["丙", "甲"],
-      ["丁", "乙"],
-    ],
+    [[["甲", "乙"], ["丙", "丁"]]],
+    [[["丙", "丁"], ["甲", "乙"]]],
   ];
-  const rows = fairnessReport(rotated, [{ name: "甲" }, { name: "乙" }, { name: "丙" }, { name: "丁" }]);
+  const rotatedRows = fairnessReport(rotated, [
+    { name: "甲" },
+    { name: "乙" },
+    { name: "丙" },
+    { name: "丁" },
+  ]);
   must(
-    rows.every((r) => r.gaps.length === 0),
-    `轮换到位不该有 gap，实际 ${JSON.stringify(rows.filter((r) => r.gaps.length))}`,
+    rotatedRows.every((r) => r.front === 1 && r.back === 1),
+    `每人应前后排各一次，实际 ${JSON.stringify(rotatedRows.map((r) => [r.name, r.front, r.back]))}`,
+  );
+  must(
+    rotatedRows.every((r) => r.gaps.length === 0),
+    `轮换到位不该有 gap，实际 ${JSON.stringify(rotatedRows.filter((r) => r.gaps.length))}`,
   );
 
-  // 有人永远坐在同一排 → 该人应被标出「没坐过后排」
+  // 有人永远坐在同一排 → 标「没坐过后排」，但不该标「没坐过中排」（这教室没有中排）
   const skew: Grid[] = [
-    [
-      ["甲", "乙"],
-      ["丙", "丁"],
-    ],
-    [
-      ["甲", "乙"],
-      ["丁", "丙"],
-    ],
+    [[["甲", "乙"], ["丙", "丁"]]],
+    [[["甲", "乙"], ["丁", "丙"]]],
   ];
   const skewRows = fairnessReport(skew, [{ name: "甲" }, { name: "乙" }]);
   const jiaSkew = skewRows.find((r) => r.name === "甲")!;
   must(
-    jiaSkew.gaps.some((g) => g.includes("后排")),
-    `甲 从没坐过后排，应被标出，实际 ${JSON.stringify(jiaSkew.gaps)}`,
+    jiaSkew.front === 2 && jiaSkew.back === 0,
+    `甲应前排 2 后排 0，实际 ${JSON.stringify(jiaSkew)}`,
   );
   must(
-    jiaSkew.front === 2 && jiaSkew.back === 0,
-    `甲 应前排 2 后排 0，实际 ${JSON.stringify(jiaSkew)}`,
+    jiaSkew.gaps.some((g) => g.includes("后排")),
+    `甲从没坐过后排，应被标出，实际 ${JSON.stringify(jiaSkew.gaps)}`,
+  );
+  must(
+    !jiaSkew.gaps.some((g) => g.includes("中排")),
+    `2 排教室没有中排，不该标「没坐过中排」，实际 ${JSON.stringify(jiaSkew.gaps)}`,
+  );
+
+  // 位置带划分直接钉死：每种排数各人是前/中/后，避免再出现「靠浮点边界碰巧对」的写法
+  const bands = (total: number) => {
+    const grid: Grid = [Array.from({ length: total }, (_, ri) => [`r${ri}`])];
+    const students = Array.from({ length: total }, (_, ri) => ({ name: `r${ri}` }));
+    return fairnessReport([grid], students)
+      .map((r) => `${r.name}=${r.front}${r.mid}${r.back}`)
+      .join(",");
+  };
+  must(bands(1) === "r0=100", `1 排应全算前排，实际 ${bands(1)}`);
+  must(bands(2) === "r0=100,r1=001", `2 排应前/后（无中排），实际 ${bands(2)}`);
+  must(bands(3) === "r0=100,r1=010,r2=001", `3 排应三等分，实际 ${bands(3)}`);
+  must(
+    bands(8) === "r0=100,r1=100,r2=100,r3=010,r4=010,r5=010,r6=001,r7=001",
+    `8 排应 3/3/2，实际 ${bands(8)}`,
   );
 ```
 
@@ -303,16 +349,36 @@ export interface FairnessRow extends RoundStat {
   gaps: string[];
 }
 
-/** 数出每个名字在各轮里坐过什么位置；只统计名单里出现过的名字 */
-function countPositions(grids: Grid[]): Map<string, RoundStat & { groups: number[] }> {
+/**
+ * 位置带：1 排只有前排；2 排就是前后排（**没有中排**）；3 排及以上才三等分。
+ *
+ * 刻意不写成 `ri < total / 3 ? ... : ri >= (total * 2) / 3 ? ...`：那是浮点除法，
+ * 2 排时 `(2*2)/3 = 1.3333`，`ri=1 >= 1.3333` 为假 → 后排取不到、反倒多出一个中排。
+ * 这种"靠浮点边界碰巧对"的写法读代码的人验不出来，所以把每种排数摊开写。
+ */
+function bandOf(ri: number, total: number): "front" | "mid" | "back" {
+  if (total <= 1) return "front";
+  if (total === 2) return ri === 0 ? "front" : "back";
+  if (ri <= Math.floor((total - 1) / 3)) return "front";
+  if (ri >= Math.ceil((total * 2) / 3)) return "back";
+  return "mid";
+}
+
+/** 数出每个名字在各轮里坐过什么位置；顺带记录每个位置带在教室里是否存在 */
+function countPositions(grids: Grid[]): {
+  byName: Map<string, RoundStat & { groups: number[] }>;
+  /** 该位置带在全班一共出现过多少个座位：为 0 说明这个教室压根没有「中排」这种位置 */
+  bandSeats: Record<"front" | "mid" | "back", number>;
+} {
   const byName = new Map<string, RoundStat & { groups: number[] }>();
+  const bandSeats = { front: 0, mid: 0, back: 0 };
   for (const grid of grids) {
     grid.forEach((rows, gi) => {
       const total = rows.length;
       rows.forEach((row, ri) => {
-        // 三等分：前 1/3 排 = 前排，后 1/3 排 = 后排，其余中排。排数少时中间段自然为空
-        const band = ri < total / 3 ? "front" : ri >= (total * 2) / 3 ? "back" : "mid";
+        const band = bandOf(ri, total);
         row.forEach((name, si) => {
+          bandSeats[band] += 1; // 空位也算「这个位置存在」
           const key = name?.trim();
           if (!key) return;
           const cur =
@@ -327,15 +393,15 @@ function countPositions(grids: Grid[]): Map<string, RoundStat & { groups: number
       });
     });
   }
-  return byName;
+  return { byName, bandSeats };
 }
 
 /** 喂给模型的紧凑计分表（按名单顺序，只给有位置数据的） */
 export function roundStatsOf(grids: Grid[], students: RosterStudent[]): RoundStat[] {
-  const counted = countPositions(grids);
+  const { byName } = countPositions(grids);
   const out: RoundStat[] = [];
   for (const s of students) {
-    const c = counted.get(s.name.trim());
+    const c = byName.get(s.name.trim());
     if (!c) continue;
     const { name, front, mid, back, left, right } = c;
     out.push({ name, front, mid, back, left, right });
@@ -345,16 +411,18 @@ export function roundStatsOf(grids: Grid[], students: RosterStudent[]): RoundSta
 
 /** 公平统计表：判定口径刻意朴素——某一类排位置一次都没轮到才算 gap */
 export function fairnessReport(grids: Grid[], students: RosterStudent[]): FairnessRow[] {
-  const counted = countPositions(grids);
+  const { byName, bandSeats } = countPositions(grids);
   const out: FairnessRow[] = [];
   for (const s of students) {
-    const c = counted.get(s.name.trim());
+    const c = byName.get(s.name.trim());
     if (!c) continue;
     const gaps: string[] = [];
+    // 只对「这个教室里真实存在的位置带」判轮空：2 排的教室没有中排，
+    // 否则会拿计数当代理去压，反而全班每个人都被标一句「没坐过中排」
     if (grids.length > 1) {
-      if (c.front === 0) gaps.push("没坐过前排");
-      if (c.mid === 0 && c.front + c.mid + c.back >= grids.length) gaps.push("没坐过中排");
-      if (c.back === 0) gaps.push("没坐过后排");
+      if (bandSeats.front > 0 && c.front === 0) gaps.push("没坐过前排");
+      if (bandSeats.mid > 0 && c.mid === 0) gaps.push("没坐过中排");
+      if (bandSeats.back > 0 && c.back === 0) gaps.push("没坐过后排");
     }
     out.push({ ...c, groups: [...c.groups], gaps });
   }
