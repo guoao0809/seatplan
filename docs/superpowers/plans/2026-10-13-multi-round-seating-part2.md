@@ -261,7 +261,25 @@ Task 11 给 `ArrangeInput` 加了 `rounds?: number`，payload 里只有 `> 1` �
 
 - [ ] **Step 2: runAi 改成单次调用**
 
-`runAi()` 的循环体整个换掉（函数签名、取消、错误处理、`finally` 结构不变）：
+**先替换掉 `roundInstruction`**（Task 8 留下的那个是「第 i 次换座，基于上一次继续轮换」的说法，跟"一次给出 N 组"直接矛盾——留着会让模型以为只要给一轮）。删掉它，换成：
+
+```ts
+/** 一次生成 N 次时的指令：规则原文 + 多轮说明（+ 重试提示） */
+function manyRoundInstruction(rule: string, total: number, retryHint: string): string {
+  const lines = [
+    rule,
+    "",
+    `（请一次给出 ${total} 次换座：rounds 数组正好 ${total} 组，第 1 组以 current 为基准，之后每组接续前一组的结果，整体做到公平轮换。）`,
+  ];
+  if (retryHint) lines.push(retryHint);
+  return lines.join("\n");
+}
+```
+
+**再从 `SeatView.vue` 顶部那条 `../lib/rotation` 的 import 里删掉 `roundStatsOf`**（Task 11 已把它从 `rotation.ts` 删除，留着就是编译不过的那条 TS2724）。改完应是 `import { deskmateConflicts, fairnessReport, noDeskmatePairs } from "../lib/rotation";`。
+`parseArrangement` 的 import **保留**（`runFollowUp` 还在用）。
+
+然后 `runAi()` 的循环体整个换掉（函数签名、取消、错误处理、`finally` 结构不变）：
 
 ```ts
 async function runAi() {
@@ -298,7 +316,7 @@ async function runAi() {
         labels,
         singleSeatName: singleSeatName.value,
         history: [],
-        instruction: `${roundInstruction(1, total, rule, "")}${lastConflict ? `\n\n注意：${lastConflict}` : ""}`,
+        instruction: `${manyRoundInstruction(rule, total, "")}${lastConflict ? `\n\n注意：${lastConflict}` : ""}`,
         students: roster.value,
         rounds: total,
       });
