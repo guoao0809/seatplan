@@ -321,6 +321,44 @@ git commit -m "feat(rotation): 不能同桌硬约束的解析与逐轮冲突检�
     bands(8) === "r0=100,r1=100,r2=100,r3=010,r4=010,r5=010,r6=001,r7=001",
     `8 排应 3/3/2，实际 ${bands(8)}`,
   );
+
+  // 名单里有、但一轮都没排上的学生：不能从公平表里消失（60 人班级排不下容量时就会出现）
+  const ghostGrids: Grid[] = [
+    [[["甲", "乙"], ["丙", "丁"], ["戊", "己"]]],
+    [[["甲", "乙"], ["丙", "丁"], ["戊", "己"]]],
+  ];
+  const ghostRows = fairnessReport(ghostGrids, [{ name: "甲" }, { name: "落空" }]);
+  must(ghostRows.length === 2, `落空的学生也要出行，实际 ${ghostRows.length}`);
+  const ghost = ghostRows.find((r) => r.name === "落空")!;
+  must(ghost.front === 0 && ghost.mid === 0 && ghost.back === 0, "落空的学生位置计数应全 0");
+  must(
+    ghost.gaps.length === 3,
+    `落空的学生三类排位置都该标出来，实际 ${JSON.stringify(ghost.gaps)}`,
+  );
+  must(
+    roundStatsOf(ghostGrids, [{ name: "落空" }]).length === 1,
+    "计分表也要给落空的学生留一行，模型才知道谁一次都没排上",
+  );
+
+  // groups 不能有 undefined 空洞（渲染出来就是 "undefined"）
+  const twoGroups: Grid = [[["丙", "丁"]], [["甲", "乙"]]];
+  const groupRow = fairnessReport([twoGroups], [{ name: "甲" }])[0]!;
+  must(
+    groupRow.groups.length === 2 && groupRow.groups.every((n) => typeof n === "number"),
+    `groups 应为长度 2 且无空洞，实际 ${JSON.stringify(groupRow.groups)}`,
+  );
+  must(
+    groupRow.groups[0] === 0 && groupRow.groups[1] === 1,
+    `groups 计数不对，实际 ${JSON.stringify(groupRow.groups)}`,
+  );
+
+  // 3 座排的中间座既不算左也不算右（左右公平只对靠边的座位有意义）
+  const wide: Grid = [[["甲", "乙", "丙"]]];
+  const wideRow = fairnessReport([wide], [{ name: "乙" }])[0]!;
+  must(
+    wideRow.left === 0 && wideRow.right === 0,
+    `3 座排的中间座不该算左或右，实际 ${JSON.stringify(wideRow)}`,
+  );
 ```
 
 - [ ] **Step 2: 跑自检，确认失败**
@@ -385,8 +423,9 @@ function countPositions(grids: Grid[]): {
             byName.get(key) ??
             { name: key, front: 0, mid: 0, back: 0, left: 0, right: 0, groups: [] };
           cur[band] += 1;
+          // 靠左 / 靠右只对靠边的座位有意义：3 座及以上的中间座既不算左也不算右
           if (si === 0) cur.left += 1;
-          else cur.right += 1;
+          else if (si === row.length - 1) cur.right += 1;
           cur.groups[gi] = (cur.groups[gi] ?? 0) + 1;
           byName.set(key, cur);
         });
@@ -396,14 +435,21 @@ function countPositions(grids: Grid[]): {
   return { byName, bandSeats };
 }
 
-/** 喂给模型的紧凑计分表（按名单顺序，只给有位置数据的） */
+/** 名单里有、但一轮都没排上的学生：给一行全 0 —— 那正是最极端的「没轮到」，
+ *  不能让他从公平表里消失（60 人的班级排不下容量时就会出现这种学生） */
+function emptyCounts(name: string): RoundStat & { groups: number[] } {
+  return { name, front: 0, mid: 0, back: 0, left: 0, right: 0, groups: [] };
+}
+
+/** 喂给模型的紧凑计分表（按名单顺序；一轮都没排上的学生也留一行全 0） */
 export function roundStatsOf(grids: Grid[], students: RosterStudent[]): RoundStat[] {
   const { byName } = countPositions(grids);
   const out: RoundStat[] = [];
   for (const s of students) {
-    const c = byName.get(s.name.trim());
-    if (!c) continue;
-    const { name, front, mid, back, left, right } = c;
+    const name = s.name.trim();
+    if (!name) continue;
+    const c = byName.get(name) ?? emptyCounts(name);
+    const { front, mid, back, left, right } = c;
     out.push({ name, front, mid, back, left, right });
   }
   return out;
@@ -414,8 +460,9 @@ export function fairnessReport(grids: Grid[], students: RosterStudent[]): Fairne
   const { byName, bandSeats } = countPositions(grids);
   const out: FairnessRow[] = [];
   for (const s of students) {
-    const c = byName.get(s.name.trim());
-    if (!c) continue;
+    const name = s.name.trim();
+    if (!name) continue;
+    const c = byName.get(name) ?? emptyCounts(name);
     const gaps: string[] = [];
     // 只对「这个教室里真实存在的位置带」判轮空：2 排的教室没有中排，
     // 否则会拿计数当代理去压，反而全班每个人都被标一句「没坐过中排」
@@ -424,7 +471,9 @@ export function fairnessReport(grids: Grid[], students: RosterStudent[]): Fairne
       if (bandSeats.mid > 0 && c.mid === 0) gaps.push("没坐过中排");
       if (bandSeats.back > 0 && c.back === 0) gaps.push("没坐过后排");
     }
-    out.push({ ...c, groups: [...c.groups], gaps });
+    // 用 Array.from 而不是 .map：稀疏数组的 map 会跳过空洞，留下的 undefined
+    // 渲染到表格里就是一行 "undefined"
+    out.push({ ...c, groups: Array.from(c.groups, (n) => n ?? 0), gaps });
   }
   return out;
 }
