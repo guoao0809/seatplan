@@ -1235,6 +1235,21 @@ git commit -m "feat(ai): 一次生成 N 轮链式排座（含硬约束逐轮校�
   - `runFollowUpAll(): Promise<void>`、`applyRounds(): void`、`saveRoundsToRecords(): void`
   - `fairnessRows` computed
 
+- [ ] **Step 0: 三处顺手修（Task 8 审查带出，同一个文件，别单开一轮）**
+
+```ts
+// (1) 两个禁用按钮补上禁用态样式：现在它们看起来可点、hover 还有反应，点了却什么都不发生
+//     在预览态「返回修改」「应用到座位图」的 class 里补 disabled:opacity-50 disabled:cursor-not-allowed
+//     （与既有「开始排座」「追问」按钮的写法一致）
+
+// (2) runAi 里那行内联的钳位算式改成用已存在的计算属性，避免两份公式将来走岔
+const total = roundsClamped.value;
+
+// (3) resetAiRun 的注释补一句它的新副作用：
+//     /** 清空一次排座的全部中间状态（预览、理由、对话、追问框）。
+//      *  注意：它同时会作废在途的链（aiReqId++）——不要在一次新排座的 id 取号之后再调用它。 */
+```
+
 - [ ] **Step 1: 预览左栏套轮播**
 
 预览态左栏（讲台 + 单座 + 各组那一段）用 `RoundSwitcher` 包住，`warn` 取当前轮是否有警告：
