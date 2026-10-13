@@ -229,7 +229,9 @@ function showRound(i: number) {
   roundIndex.value = i;
   seatGrid.value = grid.map((rowArr, gi) => ({
     label: groupLabel(gi, grid.length, reverseGroups.value),
-    color: groupColor(gi),
+    // 读组配置而不是 groupColor()：后者读的是 seatGrid 里上一张网格的颜色，
+    // 回显自带配色的记录时首屏会取到旧调色板
+    color: groupCfgs.value[gi]?.color ?? paletteColor(gi),
     rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
   }));
   persistGrid();
@@ -662,7 +664,7 @@ function applyRestore(p: RestorePayload) {
   groupCfgs.value = toGroupConfigs(p.rows, p.colors);
   singleSeatName.value = p.singleSeatName || "";
   // 老记录只有单张 grid；带 rounds 的记录回显整组，回显后仍能轮播
-  seatRounds.value = p.rounds?.length ? p.rounds : [p.grid];
+  seatRounds.value = p.rounds?.length ? [...p.rounds] : [p.grid];
   roundIndex.value = 0;
   showRound(0); // 它负责重建 seatGrid 并按 seatRounds[0] 落盘
 }

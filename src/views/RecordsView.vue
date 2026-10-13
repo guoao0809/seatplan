@@ -65,7 +65,7 @@ function fmt(ts: number) {
           <div class="text-sm text-title">
             <span
               v-if="r.label"
-              class="mr-1.5 rounded bg-primary/10 px-1.5 py-0.5 text-[11px] text-primary"
+              class="rounded bg-primary/10 px-1.5 py-0.5 text-[11px] text-primary"
             >
               {{ r.label }}
             </span>

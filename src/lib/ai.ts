@@ -4,8 +4,8 @@
 // 这样「抄错姓名」「数错每组排数」「自述做了其实没做」三类错误在结构上不可能发生——
 // 姓名与维度根本不经过模型的手。代价是模型只能表达这套操作能覆盖的调整。
 //
-// 本文件不含任何静态 import，可独立自检：node --experimental-strip-types src/lib/ai.ts
-// （下面这条 import type 只用于类型、会被完全擦除，不影响可独立自检）
+// 本文件不含任何**运行时** import（只有一句类型导入，编译时会被擦除），可独立自检：
+// node --experimental-strip-types src/lib/ai.ts
 
 /** config.json 的内容（OpenAI 兼容） */
 export interface AiConfig {
