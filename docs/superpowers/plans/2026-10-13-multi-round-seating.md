@@ -1521,7 +1521,11 @@ git commit -m "feat(ai): 预览轮播、追问范围、应用整组与批量存�
 
 2. **删掉死状态 `aiProgress`**：一次调用没有逐轮进度，它现在只写不读（两个显示点已改成「正在生成 N 次」，不再依赖它）。删掉声明、`runAi` 里的赋值、`resetAiRun` 里的复位、以及 `finally` 里那行。
 
-3. **两处注释仍称 `runAi` 为「链式生成」**（`runFollowUp` / `runFollowUpAll` 上方），说法已不成立，改成「一次生成 N 次」。
+3. **两处注释仍称 `runAi` 为「链式生成」**（`runFollowUp` / `runFollowUpAll` 上方，另有 `resetAiRun` 里「作废在途的链」两处），说法已不成立，改成「一次生成 N 次」/「作废在途请求」。
+
+4. **`manyRoundInstruction` 的 `retryHint` 参数是死的**：调用处永远传 `""`，重试提示是另外拼上去的（`lastConflict`），所以函数里 `if (retryHint) lines.push(retryHint)` 那支不可达。改成**把 `lastConflict` 当 `retryHint` 传进去**，并删掉调用处那截手动拼接——参数就活了，也不必维护两套拼法。
+
+5. **`aiThinking` 在重试时不清**：它现在在重试循环**之前**清一次，于是撞硬约束重生成时，思考框会把第 1 次尝试和第 2 次尝试的推理连在一起显示。改成**每次尝试开头清一次**（即放进 `for (attempt…)` 循环体内第一行）。
 
 - [ ] **Step 1: 全量自检**
 
