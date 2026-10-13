@@ -5,6 +5,9 @@
 // 姓名与维度根本不经过模型的手。代价是模型只能表达这套操作能覆盖的调整。
 //
 // 本文件不含任何静态 import，可独立自检：node --experimental-strip-types src/lib/ai.ts
+// （下面这条 import type 只用于类型、会被完全擦除，不影响可独立自检）
+
+import type { RoundStat } from "./rotation";
 
 /** config.json 的内容（OpenAI 兼容） */
 export interface AiConfig {
@@ -56,6 +59,8 @@ export interface ArrangeInput {
   instruction: string;
   /** 学生档案（特点 / 注意事项），排座时需照顾到的个体需求 */
   students?: StudentNote[];
+  /** 前几轮的位置计分表（程序算，喂给模型判断公平），没有多轮时可为空 */
+  roundStats?: RoundStat[];
 }
 
 /** 一个学生的特点与注意事项；name 与网格里的姓名对应 */
@@ -151,11 +156,14 @@ const SYSTEM_PROMPT = [
   "8. students 是学生档案（可为空），给出部分学生的特点（trait）与注意事项（note）。排座要照顾到它们：",
   "   近视 / 个子矮靠前，好动 / 话多分开，需要单独坐的排到边缘或单座，写明「不能同桌」的绝不排一起。",
   "   照顾不到时在 reason 里说明，不要假装做到了。",
-  "9. 约束涉及同桌时（「A 不能和 B 同桌」「有同样特点的不能同桌」等），必须拿 deskPairs **逐对过一遍**：",
+  "9. roundStats 是前几次换座的位置计分表（可为空）：每人已坐前/中/后排、左/右各几次。",
+  "   用户要求「公平轮换」时，优先把 front/mid/back 明显偏低（尤其为 0）的学生换到缺的位置去，",
+  "   而不是平均主义地打乱所有人。",
+  "10. 约束涉及同桌时（「A 不能和 B 同桌」「有同样特点的不能同桌」等），必须拿 deskPairs **逐对过一遍**：",
   "   凡违反的对，都要用 swapSeats 把其中一人换到一个不会制造新违规的座位去。",
   "   注意 deskPairs 的每一对里，两个座位**本来就是同桌**——把它们两个对调等于什么都没做，这是最常见的错误。",
   "   下完操作后自己再核对一遍：deskPairs 里不该再有任何一对违反用户约束。",
-  "10. 思考过程一律用中文写（给用户看的），不要用英文。",
+  "11. 思考过程一律用中文写（给用户看的），不要用英文。",
 ].join("\n");
 
 /** 构造首轮的 system + user 消息 */
@@ -177,6 +185,7 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
     roster: input.singleSeatName ? [...inGrid, input.singleSeatName] : inGrid,
     ...(students.length > 0 ? { students } : {}),
     deskPairs: deskPairsOf(input.grid, input.students ?? []),
+    ...(input.roundStats?.length ? { roundStats: input.roundStats } : {}),
     current: input.grid,
     history: input.history,
   };
@@ -604,6 +613,24 @@ export function runAiSelfCheck(): void {
       buildMessages({ grid: base, labels, singleSeatName: "", history: [], instruction: "排座" }).user,
     ) as { students?: unknown; deskPairs: DeskPair[] };
     must(!("students" in noNotes), "没有档案时不应出现 students 字段");
+
+    // 公平计分表：给了就带上，没给不出现该字段
+    const withStats = JSON.parse(
+      buildMessages({
+        grid: base,
+        labels,
+        singleSeatName: "",
+        history: [],
+        instruction: "排座",
+        roundStats: [{ name: "甲", front: 2, mid: 1, back: 0, left: 1, right: 2 }],
+      }).user,
+    ) as { roundStats?: unknown };
+    must(
+      JSON.stringify(withStats.roundStats) ===
+        JSON.stringify([{ name: "甲", front: 2, mid: 1, back: 0, left: 1, right: 2 }]),
+      `roundStats 应原样进 payload，实际 ${JSON.stringify(withStats.roundStats)}`,
+    );
+    must(!("roundStats" in noNotes), "没给计分表时不应出现 roundStats 字段");
 
     // deskPairs：同桌对由程序算好——每排一组相邻两座，带上两人的档案，空位是 null，双空排不出现
     const pairs = noNotes.deskPairs;
