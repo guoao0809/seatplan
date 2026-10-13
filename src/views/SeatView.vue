@@ -87,6 +87,10 @@ const showAi = ref(false);
 const aiPrompt = ref("根据上一次排的座位，自动左右调整，保证每个孩子都公平");
 /** 一次生成的次数，1~20 */
 const roundsToGenerate = ref(8);
+/** 实际会跑的次数（钳到 1~20）：按钮文案与耗时预估都用它，免得填 999 显示 999 却只跑 20 */
+const roundsClamped = computed(() =>
+  Math.min(20, Math.max(1, Math.round(roundsToGenerate.value) || 1)),
+);
 const aiBusy = ref(false);
 // 单调递增的请求 id：closeAi 时 bump 作废在途请求，替代「弹窗是否还开着」这个不可靠代理
 let aiReqId = 0;
@@ -345,6 +349,8 @@ function closeAi() {
 
 /** 清空一次排座的全部中间状态（预览、理由、对话、追问框） */
 function resetAiRun() {
+  aiReqId++; // 作废在途的链：否则它跑完会继续往刚清空的 aiRounds 里写
+  aiBusy.value = false; // 链已作废，界面不能继续卡在「排座中」
   aiRounds.value = [];
   aiRoundIndex.value = 0;
   aiProgress.value = { done: 0, total: 0 };
@@ -440,6 +446,7 @@ async function runAi() {
   try {
     for (let i = 1; i <= total; i++) {
       aiProgress.value = { done: i, total };
+      aiThinking.value = ""; // 每轮从头攒思考过程，否则 8 轮的思考会连成一大坨
       let hint = "";
       let round: AiRound | null = null;
 
@@ -449,10 +456,16 @@ async function runAi() {
           grid: base,
           labels,
           singleSeatName: singleSeatName.value,
-          history: aiRounds.value.slice(-3).map((r) => r.grid),
+          // payload 的 history 约定是「最新在前」，与既有传记录的顺序一致
+          history: aiRounds.value.slice(-3).reverse().map((r) => r.grid),
           instruction: roundInstruction(i, total, rule, hint),
           students: roster.value,
-          roundStats: roundStatsOf([...aiRounds.value.map((r) => r.grid), base], roster.value),
+          // 第 1 轮时 aiRounds 还空着，此时基准是主页那张图；第 2 轮起 base 已经躺在 aiRounds 里了，
+          // 再加一次就会把上一轮算两遍、计分表翻倍
+          roundStats: roundStatsOf(
+            aiRounds.value.length ? aiRounds.value.map((r) => r.grid) : [base],
+            roster.value,
+          ),
         });
 
         let text = "";
@@ -490,10 +503,9 @@ async function runAi() {
         hint = `上一版仍把「${conflicts[0]![0]}」和「${conflicts[0]![1]}」排成了同桌，这次必须把他们拆开。`;
       }
 
-      if (!round) return;
-      aiRounds.value = [...aiRounds.value, round];
-      base = round.grid;
-      if (i === 1) aiRoundIndex.value = 0;
+      // 内层循环只有两种出口：round 已赋值，或已直接 return——所以这里不必再判空（! 只为让 TS 认可该不变式）
+      aiRounds.value = [...aiRounds.value, round!];
+      base = round!.grid;
     }
   } catch (e) {
     if (id !== aiReqId) return;
@@ -1256,7 +1268,7 @@ const draftCapacity = computed(
             />
             <span class="text-xs text-muted">
               1~20 次，逐次串行生成；预计 ≈
-              {{ Math.max(1, roundsToGenerate || 1) }} × 每轮耗时（关推理 2~4 秒，
+              {{ roundsClamped }} × 每轮耗时（关推理 2~4 秒，
               开推理 50~80 秒）
             </span>
           </div>
@@ -1450,17 +1462,19 @@ const draftCapacity = computed(
               @click="runAi"
             >
               <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
-              {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${Math.max(1, roundsToGenerate || 1)} 次）` }}
+              {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${roundsClamped} 次）` }}
             </button>
           </template>
           <template v-else>
             <button
               class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              :disabled="aiBusy"
               @click="resetAiRun"
             >
               返回修改
             </button>            <button
               class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
+              :disabled="aiBusy"
               @click="applyAi"
             >
               应用到座位图
