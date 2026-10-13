@@ -50,12 +50,14 @@ import {
   type Grid,
 } from "../lib/ai";
 import { showToast } from "../components/toast";
+import RoundSwitcher from "../components/RoundSwitcher.vue";
 
 const props = defineProps<{ restore: RestorePayload | null }>();
 
 const LS_ROSTER = "seatplan:roster";
 const LS_CFG = "seatplan:cfg";
 const LS_GRID = "seatplan:grid";
+const LS_ROUNDS = "seatplan:rounds";
 
 // 名单表格：姓名 + 学生特点 + 注意事项。排座只认姓名，另两列喂给 AI 与座位悬浮提示
 const roster = ref<RosterRow[]>(toRosterRows(DEFAULT_ROSTER));
@@ -145,6 +147,9 @@ function seatStyle(g: Group, hasName: boolean) {
 
 // 可拖拽的座位网格：名单+配置是种子，拖拽可交换座位姓名
 const seatGrid = ref<Group[]>([]);
+/** 一次生成的多轮座位图；N=1 时长度就是 1，行为与单张完全一致 */
+const seatRounds = ref<Grid[]>([[]]);
+const roundIndex = ref(0);
 interface DragPos {
   g: number;
   r: number;
@@ -169,11 +174,28 @@ function isDragSource(g: number, r: number, s: number) {
 }
 
 function persistGrid() {
+  const grid = currentGrid();
+  seatRounds.value[roundIndex.value] = grid; // 主图拖拽/重排后回写当前这一轮
+  localStorage.setItem(LS_GRID, JSON.stringify(grid));
   localStorage.setItem(
-    LS_GRID,
-    JSON.stringify(seatGrid.value.map((g) => g.rows.map((row) => row.seats.map((s) => s.name)))),
+    LS_ROUNDS,
+    JSON.stringify({ rounds: seatRounds.value, index: roundIndex.value }),
   );
 }
+
+/** 切到第 i 轮：用它重建显示用的 seatGrid（与 applyRestore 建法一致） */
+function showRound(i: number) {
+  const grid = seatRounds.value[i];
+  if (!grid) return;
+  roundIndex.value = i;
+  seatGrid.value = grid.map((rowArr, gi) => ({
+    label: groupLabel(gi, grid.length, reverseGroups.value),
+    color: groupColor(gi),
+    rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
+  }));
+  persistGrid();
+}
+
 function seedGrid() {
   seatGrid.value = assignSeats(
     rosterNames.value,
@@ -181,6 +203,8 @@ function seedGrid() {
     seatCount.value,
     reverseGroups.value,
   );
+  seatRounds.value = [currentGrid()];
+  roundIndex.value = 0;
   persistGrid();
 }
 /** 用上次持久化的网格覆盖（保留拖拽结果） */
@@ -597,9 +621,24 @@ onMounted(() => {
       /* 配置损坏则忽略，用默认 */
     }
   }
+  // 多轮结果优先：读到了就不再走单轮种子/恢复（否则 persistGrid 会把它覆盖掉）
+  let roundsLoaded = false;
+  const savedRounds = localStorage.getItem(LS_ROUNDS);
+  if (savedRounds) {
+    try {
+      const { rounds, index } = JSON.parse(savedRounds) as { rounds: Grid[]; index: number };
+      if (Array.isArray(rounds) && rounds.length > 0) {
+        seatRounds.value = rounds;
+        showRound(Math.min(Math.max(0, index || 0), rounds.length - 1));
+        roundsLoaded = true;
+      }
+    } catch {
+      /* 多轮数据损坏则忽略，退回单轮 */
+    }
+  }
   if (props.restore) {
     applyRestore(props.restore);
-  } else {
+  } else if (!roundsLoaded) {
     seedGrid();
     applySavedGrid();
   }
@@ -756,7 +795,8 @@ const draftCapacity = computed(
     <div class="min-h-0 flex-1 overflow-auto bg-surface p-6">
       <!-- w-max 不能用 w-fit：fit-content 会被容器宽度夹住，座位溢出到元素盒子外，
            html-to-image 按 clientWidth 量尺寸就会把右侧裁掉 -->
-      <div ref="seatChartRef" class="mx-auto w-max rounded-xl bg-white p-8 shadow">
+      <RoundSwitcher :index="roundIndex" :total="seatRounds.length" @change="showRound">
+        <div ref="seatChartRef" class="mx-auto w-max rounded-xl bg-white p-8 shadow">
         <div class="flex flex-col items-start gap-8">
           <!-- 前排：讲台（左侧）+ 右侧单独座位。老师视角下讲台转到右下角，单座同时换到讲台左侧 -->
           <!-- 间距必须与下面组行的 gap-10 一致，单座才能正对第二组的左列课桌 -->
@@ -817,6 +857,7 @@ const draftCapacity = computed(
           </div>
         </div>
       </div>
+      </RoundSwitcher>
 
       <!-- 空态：无名单 -->
       <div
