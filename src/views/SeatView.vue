@@ -113,8 +113,6 @@ interface AiRound {
 }
 const aiRounds = ref<AiRound[]>([]);
 const aiRoundIndex = ref(0);
-/** 生成进度，仅 aiBusy 时有意义 */
-const aiProgress = ref({ done: 0, total: 0 });
 /** 当前展示的那一轮 */
 const aiRound = computed<AiRound | null>(() => aiRounds.value[aiRoundIndex.value] ?? null);
 /** 追问输入框 */
@@ -372,13 +370,12 @@ function closeAi() {
 }
 
 /** 清空一次排座的全部中间状态（预览、理由、对话、追问框）。
- *  注意：它同时会作废在途的链（aiReqId++）——不要在一次新排座的 id 取号之后再调用它。 */
+ *  注意：它同时会作废在途请求（aiReqId++）——不要在一次新排座的 id 取号之后再调用它。 */
 function resetAiRun() {
-  aiReqId++; // 作废在途的链：否则它跑完会继续往刚清空的 aiRounds 里写
-  aiBusy.value = false; // 链已作废，界面不能继续卡在「排座中」
+  aiReqId++; // 作废在途请求：否则它跑完会继续往刚清空的 aiRounds 里写
+  aiBusy.value = false; // 请求已作废，界面不能继续卡在「排座中」
   aiRounds.value = [];
   aiRoundIndex.value = 0;
-  aiProgress.value = { done: 0, total: 0 };
   aiPreviewEdited.value = false;
   aiThinking.value = "";
   aiError.value = "";
@@ -425,7 +422,6 @@ async function runAi() {
 
   aiBusy.value = true;
   aiError.value = "";
-  aiThinking.value = "";
   aiRounds.value = [];
   aiRoundIndex.value = 0;
 
@@ -434,12 +430,13 @@ async function runAi() {
   try {
     // 一次调用拿 N 组操作；撞硬约束就整组重生成（上限 2 次）
     for (let attempt = 0; attempt <= 2; attempt++) {
+      aiThinking.value = ""; // 每次尝试开头清一次，重生成时不把两次尝试的思考连在一起
       const { system, user } = buildMessages({
         grid: base,
         labels,
         singleSeatName: singleSeatName.value,
         history: [],
-        instruction: `${manyRoundInstruction(rule, total, "")}${lastConflict ? `\n\n注意：${lastConflict}` : ""}`,
+        instruction: manyRoundInstruction(rule, total, lastConflict),
         students: roster.value,
         rounds: total,
       });
@@ -491,7 +488,6 @@ async function runAi() {
   } finally {
     if (id === aiReqId) {
       aiBusy.value = false;
-      aiProgress.value = { done: 0, total: 0 };
     }
   }
 }
@@ -512,7 +508,7 @@ async function runFollowUp() {
     instruction: text,
     students: roster.value,
   });
-  // 链式生成（runAi）不再经过旧 callAi，aiLastRaw/aiMessages 可能为空；
+  // 一次生成 N 次（runAi）不再经过旧 callAi，aiLastRaw/aiMessages 可能为空；
   // 此时从零起一段对话即可——payload 里已带当前轮座位图，模型不丢上下文
   const msgs: ChatMessage[] = aiLastRaw.value
     ? appendFollowUp(aiMessages.value, aiLastRaw.value, user)
@@ -568,7 +564,7 @@ async function runFollowUpAll() {
   if (!text || aiBusy.value) return;
   aiPrompt.value = `${aiPrompt.value.trim()}\n${text}`;
   aiFollowUp.value = "";
-  await runAi(); // runAi 会按 roundsToGenerate 重新链式生成
+  await runAi(); // runAi 会按 roundsToGenerate 重新一次生成 N 次
 }
 
 /** 应用整组结果到主页 */
@@ -1327,8 +1323,7 @@ const draftCapacity = computed(
               class="w-20 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary disabled:opacity-60"
             />
             <span class="text-xs text-muted">
-              1~20 次，逐次串行生成；预计 ≈
-              {{ roundsClamped }} × 每轮耗时（关推理 2~4 秒，
+              1~20 次，一次生成全部座位图；预计一次调用耗时（关推理 2~4 秒，
               开推理 50~80 秒）
             </span>
           </div>
