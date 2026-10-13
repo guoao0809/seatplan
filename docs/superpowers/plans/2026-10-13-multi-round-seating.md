@@ -1245,12 +1245,27 @@ git commit -m "feat(ai): 一次生成 N 轮链式排座（含硬约束逐轮校�
 // (2) runAi 里那行内联的钳位算式改成用已存在的计算属性，避免两份公式将来走岔
 const total = roundsClamped.value;
 
-// (3) resetAiRun 的注释补一句它的新副作用：
+// (3) resetAiRun 的注释补一句它的新副作用，并顺带把追问范围也复位：
 //     /** 清空一次排座的全部中间状态（预览、理由、对话、追问框）。
 //      *  注意：它同时会作废在途的链（aiReqId++）——不要在一次新排座的 id 取号之后再调用它。 */
+//     function resetAiRun() {
+//       …
+//       aiScope.value = "round"; // 追问范围也复位：否则下次打开还停在上次的「整体重排」
+//     }
 ```
 
 - [ ] **Step 1: 预览左栏套轮播**
+
+**先加一个切轮函数**（不要用内联箭头函数改 `aiRoundIndex`）：追问的对话历史（`aiMessages`/`aiLastRaw`）属于**某一轮**，界面换了一轮而历史还是上一轮的，模型就会收到「第 1 轮的图 + 第 1 轮的操作 + 第 3 轮的图」这种错配——最后一条 payload 虽然是当前轮，但中间那句 assistant 描述的是另一个布局，会把重排带偏：
+
+```ts
+/** 切到另一轮预览：把追问的对话历史一并清掉——历史属于上一轮，混着发等于让模型看别人的布局 */
+function selectAiRound(i: number) {
+  aiRoundIndex.value = i;
+  aiMessages.value = [];
+  aiLastRaw.value = "";
+}
+```
 
 预览态左栏（讲台 + 单座 + 各组那一段）用 `RoundSwitcher` 包住，`warn` 取当前轮是否有警告：
 
@@ -1259,7 +1274,7 @@ const total = roundsClamped.value;
               :index="aiRoundIndex"
               :total="aiRounds.length"
               :warn="!!aiRound?.warnings.length"
-              @change="(i) => (aiRoundIndex = i)"
+              @change="selectAiRound"
             >
               <!-- 原有 讲台/单座/组 整块内容不动 -->
             </RoundSwitcher>
@@ -1288,7 +1303,7 @@ const total = roundsClamped.value;
               >
                 <TriangleAlert :size="14" class="mt-px shrink-0" />
                 <span>
-                  {{ aiRound.warnings.join("；") }}（已重试 2 次仍未能拆开，请手动调整）
+                  {{ aiRound.warnings.join("；") }}（未能自动拆开，请手动调整）
                 </span>
               </div>
               <details class="shrink-0 rounded-lg border border-border bg-surface">
@@ -1435,11 +1450,12 @@ function saveRoundsToRecords() {
 
 删掉旧的 `applyAi()`，并检查 `callAi()` 是否还有调用点：没有了就一并删掉（`runFollowUp` 改成直接调 `arrangeSeats`）。
 
-按钮区把原来的「应用到座位图」绑到 `applyRounds`，并新增：
+按钮区把原来的「应用到座位图」绑到 `applyRounds`，并新增（**`:disabled="aiBusy"` 不能漏**——这一行在生成第 2..N 轮期间是可见的，不禁用就能存下一组残缺记录）：
 
 ```vue
           <button
-            class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+            class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="aiBusy"
             @click="saveRoundsToRecords"
           >
             全部存入记录
