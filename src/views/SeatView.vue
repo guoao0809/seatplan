@@ -143,6 +143,18 @@ const aiPreviewNames = computed(() =>
   aiRound.value ? flattenNames(aiRound.value.grid).length : 0,
 );
 
+/**
+ * 切换预览展示的轮次。
+ * 必须同时清掉 aiMessages/aiLastRaw：追问的对话历史是绑定在「某一轮」上的，
+ * 切轮后若沿用上一轮的 assistant 旧布局（appendFollowUp 会把它回灌），
+ * 模型会拿到「上一轮的图 + 上一轮的操作 + 当前轮的图」，重排被带偏。
+ */
+function selectAiRound(i: number) {
+  aiRoundIndex.value = i;
+  aiMessages.value = [];
+  aiLastRaw.value = "";
+}
+
 /** 已生成的各轮 → 公平统计表 */
 const fairnessRows = computed(() =>
   fairnessReport(aiRounds.value.map((r) => r.grid), roster.value),
@@ -375,6 +387,7 @@ function resetAiRun() {
   aiThinking.value = "";
   aiError.value = "";
   aiFollowUp.value = "";
+  aiScope.value = "round"; // 下次打开回到默认范围，别停在上次的「整体重排」
   aiMessages.value = [];
   aiLastRaw.value = "";
 }
@@ -1378,7 +1391,7 @@ const draftCapacity = computed(
               :index="aiRoundIndex"
               :total="aiRounds.length"
               :warn="!!aiRound?.warnings.length"
-              @change="(i) => (aiRoundIndex = i)"
+              @change="selectAiRound"
             >
             <div class="flex flex-col items-start gap-4">
               <!-- 前排：讲台 + 单座，与主图同构（老师视角下整体沉到下方、左右翻转） -->
@@ -1484,7 +1497,7 @@ const draftCapacity = computed(
               >
                 <TriangleAlert :size="14" class="mt-px shrink-0" />
                 <span>
-                  {{ aiRound.warnings.join("；") }}（已重试 2 次仍未能拆开，请手动调整）
+                  {{ aiRound.warnings.join("；") }}（未能自动拆开，请手动调整）
                 </span>
               </div>
               <details class="shrink-0 rounded-lg border border-border bg-surface">
@@ -1580,7 +1593,8 @@ const draftCapacity = computed(
               返回修改
             </button>
             <button
-              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="aiBusy"
               @click="saveRoundsToRecords"
             >
               全部存入记录
