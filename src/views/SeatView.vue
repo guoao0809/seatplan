@@ -195,6 +195,8 @@ interface DragPos {
   s: number;
 }
 const dragFrom = ref<DragPos | null>(null);
+/** 幽灵的底色 = 被拖座位所在组的颜色（跟着哪个座位拎起来，就是那个组的颜色） */
+const dragColor = computed(() => (dragFrom.value ? groupColor(dragFrom.value.g) : "#86C166"));
 const dragOverKey = ref<string | null>(null);
 const dragging = ref(false);
 const dragName = ref<string | null>(null);
@@ -1093,12 +1095,18 @@ const draftCapacity = computed(
       </div>
     </div>
 
-    <!-- 拖拽跟手幽灵：尺寸/文字与座位格一致，拖起来像把座位整个拎走 -->
+    <!-- 拖拽跟手幽灵：尺寸/文字与座位格一致，拖起来像把座位整个拎走；配色跟被拖座位所在组一致 -->
     <div
       v-if="ghost && dragName"
-      class="pointer-events-none fixed z-50 flex items-center justify-center rounded-lg bg-[#86C166] font-medium text-white shadow-lg"
+      class="pointer-events-none fixed z-50 flex items-center justify-center rounded-lg font-medium shadow-lg"
       :class="dragScope === 'preview' ? 'h-9 w-16 text-xs' : 'h-14 w-24 text-sm'"
-      :style="{ left: `${ghost.x}px`, top: `${ghost.y}px`, transform: 'translate(-50%, -50%)' }"
+      :style="{
+        left: `${ghost.x}px`,
+        top: `${ghost.y}px`,
+        transform: 'translate(-50%, -50%)',
+        backgroundColor: dragColor,
+        color: readableText(dragColor),
+      }"
     >
       {{ dragName }}
     </div>
