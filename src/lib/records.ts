@@ -12,12 +12,14 @@ export interface SeatRecord {
   singleSeatName: string;
   /** 座位网格（组 → 排 → 座 → 姓名或 null） */
   grid: (string | null)[][][];
+  /** 整组轮换（N 个网格）；一次排座生成 N 轮时带此字段。老记录没有它 → 视为单轮 */
+  rounds?: (string | null)[][][][];
 }
 
 /** 回显到排座页所需的数据子集 */
 export type RestorePayload = Pick<
   SeatRecord,
-  "rows" | "colors" | "seatsPerRow" | "singleSeatName" | "grid"
+  "rows" | "colors" | "seatsPerRow" | "singleSeatName" | "grid" | "rounds"
 >;
 
 export const LS_RECORDS = "seatplan:records";

@@ -578,26 +578,31 @@ function applyRounds() {
   showToast(`已应用 ${seatRounds.value.length} 次座位`, "success");
 }
 
-/** 把 N 轮存成 N 条记录（带「第 N 次」标签） */
-function saveRoundsToRecords() {
-  if (aiRounds.value.length === 0) return;
-  const list = loadRecords();
-  const now = Date.now();
-  const created: SeatRecord[] = aiRounds.value.map((r, i) => ({
-    id: `${now}-${i}`,
-    exportedAt: now,
-    label: `第 ${i + 1} 次`,
+/** 一次排座的记录：单轮时与老记录同形（不带 rounds），多轮时把整组带上 */
+function roundsRecord(grids: (string | null)[][][][]): SeatRecord {
+  const n = grids.length;
+  return {
+    id: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    exportedAt: Date.now(),
+    // 多轮才带 label 与 rounds：单轮产出的记录与老记录形状一致，不引入新字段
+    ...(n > 1 ? { label: `${n} 次轮换`, rounds: grids } : {}),
     rows: rows.value,
     colors: groupCfgs.value.map((c) => c.color),
     seatsPerRow: seatCount.value,
     singleSeatName: singleSeatName.value,
-    grid: r.grid,
-  }));
-  if (!saveRecords([...created, ...list])) {
+    grid: grids[0]!, // 老字段仍是第一张，任何只读 grid 的既有代码照旧可用
+  };
+}
+
+/** 把整组 N 轮存成 1 条记录，回显到主页后仍能轮播切换 */
+function saveRoundsToRecords() {
+  if (aiRounds.value.length === 0) return;
+  const n = aiRounds.value.length;
+  if (!saveRecords([roundsRecord(aiRounds.value.map((r) => r.grid)), ...loadRecords()])) {
     showToast("记录保存失败（本地存储可能已满）", "error");
     return;
   }
-  showToast(`已存入 ${created.length} 条记录`, "success");
+  showToast(`已存入记录（${n} 次轮换）`, "success");
 }
 
 /** 切换学生/老师视角：老师视角下讲台在学生后方（正下方） */
@@ -656,16 +661,10 @@ function applyRestore(p: RestorePayload) {
   // 早期记录没有 colors，回退到默认调色板
   groupCfgs.value = toGroupConfigs(p.rows, p.colors);
   singleSeatName.value = p.singleSeatName || "";
-  seatGrid.value = p.grid.map((rowArr, gi) => ({
-    label: groupLabel(gi, p.grid.length, reverseGroups.value),
-    color: groupColor(gi),
-    rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
-  }));
-  // 回显一条记录 = 回到单张状态：不重置的话，轮播会继续挂着上一批多轮结果，
-  // 界面显示的却是刚恢复的这张图，点箭头还会跳回一批陈旧的轮次
-  seatRounds.value = [currentGrid()];
+  // 老记录只有单张 grid；带 rounds 的记录回显整组，回显后仍能轮播
+  seatRounds.value = p.rounds?.length ? p.rounds : [p.grid];
   roundIndex.value = 0;
-  persistGrid();
+  showRound(0); // 它负责重建 seatGrid 并按 seatRounds[0] 落盘
 }
 
 /** dataURL(base64) → 字节数组 */
@@ -763,7 +762,12 @@ async function exportImage() {
     });
     if (!path) return; // 用户取消
     await invoke("save_png", { path, data: Array.from(zip) });
-    showToast(`已导出 ${total} 次座位图（zip）`, "success");
+    // 多轮整组只存 1 条记录（不是 N 条）；存记录排在路径确认之后，取消保存框不该留下记录
+    const ok = saveRecords([roundsRecord(seatRounds.value), ...loadRecords()]);
+    showToast(
+      `已导出 ${total} 次座位图（zip）` + (ok ? "" : "（记录保存失败：本地存储容量不足）"),
+      ok ? "success" : "info",
+    );
   } catch (e) {
     showToast(`导出失败：${e}`, "error");
   } finally {

@@ -27,6 +27,7 @@ function restore(r: SeatRecord) {
     seatsPerRow: r.seatsPerRow,
     singleSeatName: r.singleSeatName,
     grid: r.grid,
+    rounds: r.rounds,
   });
 }
 async function copyJson(r: SeatRecord) {
