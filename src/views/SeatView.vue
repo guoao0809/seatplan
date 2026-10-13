@@ -36,6 +36,7 @@ import {
   type GroupConfig,
   type RosterRow,
 } from "../lib/seat";
+import { deskmateConflicts, noDeskmatePairs, roundStatsOf } from "../lib/rotation";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
 import {
   loadAiConfig,
@@ -84,6 +85,8 @@ const draftSingleSeat = ref("");
 // AI 排座
 const showAi = ref(false);
 const aiPrompt = ref("根据上一次排的座位，自动左右调整，保证每个孩子都公平");
+/** 一次生成的次数，1~20 */
+const roundsToGenerate = ref(8);
 const aiBusy = ref(false);
 // 单调递增的请求 id：closeAi 时 bump 作废在途请求，替代「弹窗是否还开着」这个不可靠代理
 let aiReqId = 0;
@@ -91,13 +94,22 @@ const aiError = ref("");
 // 配置读取状态：loading=读取中 ok=已载入 fail=读取失败（失败时错误详情在下方红框里）
 const aiConfigStatus = ref<"loading" | "ok" | "fail">("loading");
 const aiConfig = ref<AiConfig | null>(null);
-const aiPreview = ref<(string | null)[][][] | null>(null);
 /** 预览里被手动拖过座位：此时模型给的「将执行的操作」已经过期 */
 const aiPreviewEdited = ref(false);
-/** 模型给出的「为什么这么排」 */
-const aiReason = ref("");
-/** 模型给出的操作翻成人话，供用户核对（如「交换 第四组第7排第1座 与 …」） */
-const aiSummary = ref("");
+/** 一轮生成结果 */
+interface AiRound {
+  grid: Grid;
+  reason: string;
+  summary: string;
+  /** 硬约束没拆开的学生（重试用尽时非空） */
+  warnings: string[];
+}
+const aiRounds = ref<AiRound[]>([]);
+const aiRoundIndex = ref(0);
+/** 生成进度，仅 aiBusy 时有意义 */
+const aiProgress = ref({ done: 0, total: 0 });
+/** 当前展示的那一轮 */
+const aiRound = computed<AiRound | null>(() => aiRounds.value[aiRoundIndex.value] ?? null);
 /** 追问输入框 */
 const aiFollowUp = ref("");
 /** 本轮对话（首轮 system+user，追问依次追加 assistant+user） */
@@ -115,7 +127,7 @@ watch(aiThinking, async () => {
 });
 
 const aiPreviewNames = computed(() =>
-  aiPreview.value ? flattenNames(aiPreview.value).length : 0,
+  aiRound.value ? flattenNames(aiRound.value.grid).length : 0,
 );
 
 /** 当前网格的纯数据快照（组 → 排 → 座 → 姓名或 null） */
@@ -234,14 +246,15 @@ const dragScope = ref<DragScope>("grid");
 function readSeat(scope: DragScope, g: number, r: number, s: number): string | null {
   return scope === "grid"
     ? (seatGrid.value[g]?.rows[r]?.seats[s]?.name ?? null)
-    : (aiPreview.value?.[g]?.[r]?.[s] ?? null);
+    : (aiRound.value?.grid[g]?.[r]?.[s] ?? null);
 }
 function writeSeat(scope: DragScope, g: number, r: number, s: number, name: string | null) {
   if (scope === "grid") {
     const seat = seatGrid.value[g]?.rows[r]?.seats[s];
     if (seat) seat.name = name;
-  } else if (aiPreview.value?.[g]?.[r]) {
-    aiPreview.value[g]![r]![s] = name;
+  } else {
+    const round = aiRound.value;
+    if (round?.grid[g]?.[r]) round.grid[g]![r]![s] = name;
   }
 }
 
@@ -332,11 +345,11 @@ function closeAi() {
 
 /** 清空一次排座的全部中间状态（预览、理由、对话、追问框） */
 function resetAiRun() {
-  aiPreview.value = null;
+  aiRounds.value = [];
+  aiRoundIndex.value = 0;
+  aiProgress.value = { done: 0, total: 0 };
   aiPreviewEdited.value = false;
   aiThinking.value = "";
-  aiReason.value = "";
-  aiSummary.value = "";
   aiError.value = "";
   aiFollowUp.value = "";
   aiMessages.value = [];
@@ -364,10 +377,13 @@ async function callAi(msgs: ChatMessage[], baseGrid: Grid, labels: string[]): Pr
     }
     aiMessages.value = msgs;
     aiLastRaw.value = text;
-    aiPreview.value = res.grid;
+    aiRounds.value[aiRoundIndex.value] = {
+      grid: res.grid,
+      reason: res.reason,
+      summary: res.summary,
+      warnings: [],
+    };
     aiPreviewEdited.value = false;
-    aiReason.value = res.reason;
-    aiSummary.value = res.summary;
   } catch (e) {
     if (id !== aiReqId) return; // 已作废的迟到错误不回写
     aiError.value = String(e);
@@ -381,9 +397,23 @@ function currentLabels(): string[] {
   return seatGrid.value.map((g) => g.label);
 }
 
-/** 首次排座：用当前座位图与提示词开一轮新对话 */
+/**
+ * 每轮的指令 = 规则原文 + 轮次说明（+ 重试提示）。
+ * 必须每轮重述规则：每次调用是全新会话，模型没有跨轮记忆。
+ */
+function roundInstruction(i: number, total: number, rule: string, retryHint: string): string {
+  const lines = [
+    rule,
+    "",
+    `（这是本学期第 ${i} 次换座，共 ${total} 次。current 是上一次的座位图，按同样的规则继续轮换，不要一次跳到与上一次差异过大的布局。）`,
+  ];
+  if (retryHint) lines.push(retryHint);
+  return lines.join("\n");
+}
+
+/** 一次生成 N 轮：链式——第 1 轮基于当前主页座位图，之后每轮基于上一轮 */
 async function runAi() {
-  if (aiBusy.value) return; // 重入保险：防止未来新增触发点导致并发请求
+  if (aiBusy.value) return;
   if (nameCount.value === 0) {
     aiError.value = "没有学生，无法排座";
     return;
@@ -392,33 +422,95 @@ async function runAi() {
     aiError.value = "配置未加载，请检查 config.json";
     return;
   }
-  const grid = currentGrid();
+
+  const total = Math.min(20, Math.max(1, Math.round(roundsToGenerate.value) || 1));
+  const cfg = aiConfig.value;
+  const id = ++aiReqId;
   const labels = currentLabels();
-  const { system, user } = buildMessages({
-    grid,
-    labels,
-    singleSeatName: singleSeatName.value,
-    history: loadRecords()
-      .slice(0, 2)
-      .map((r) => r.grid),
-    instruction: aiPrompt.value.trim(),
-    students: roster.value,
-  });
-  await callAi(
-    [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    grid,
-    labels,
-  );
+  const rule = aiPrompt.value.trim();
+  const pairs = noDeskmatePairs(roster.value);
+
+  aiBusy.value = true;
+  aiError.value = "";
+  aiThinking.value = "";
+  aiRounds.value = [];
+  aiRoundIndex.value = 0;
+
+  let base = currentGrid();
+  try {
+    for (let i = 1; i <= total; i++) {
+      aiProgress.value = { done: i, total };
+      let hint = "";
+      let round: AiRound | null = null;
+
+      // 硬约束：撞了就带提示重跑该轮，最多重试 2 次
+      for (let attempt = 0; attempt <= 2 && !round; attempt++) {
+        const { system, user } = buildMessages({
+          grid: base,
+          labels,
+          singleSeatName: singleSeatName.value,
+          history: aiRounds.value.slice(-3).map((r) => r.grid),
+          instruction: roundInstruction(i, total, rule, hint),
+          students: roster.value,
+          roundStats: roundStatsOf([...aiRounds.value.map((r) => r.grid), base], roster.value),
+        });
+
+        let text = "";
+        const msgs: ChatMessage[] = [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ];
+        text = await arrangeSeats(cfg, msgs, (e) => {
+          if (id !== aiReqId) return;
+          if (e.kind === "reasoning") aiThinking.value += e.text;
+        });
+        if (id !== aiReqId) return; // 已被 closeAi 作废
+
+        const res = parseArrangement(text, base, labels);
+        if (!res.ok) {
+          aiError.value = `第 ${i} 轮校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
+          return;
+        }
+
+        const conflicts = deskmateConflicts(res.grid, pairs);
+        if (conflicts.length === 0) {
+          round = { grid: res.grid, reason: res.reason, summary: res.summary, warnings: [] };
+          break;
+        }
+        if (attempt === 2) {
+          // 重试用尽：保留这轮但标黄，不静默放过、也不因为一对学生毁掉整学期
+          round = {
+            grid: res.grid,
+            reason: res.reason,
+            summary: res.summary,
+            warnings: conflicts.map(([a, b]) => `${a} 与 ${b} 仍同桌`),
+          };
+          break;
+        }
+        hint = `上一版仍把「${conflicts[0]![0]}」和「${conflicts[0]![1]}」排成了同桌，这次必须把他们拆开。`;
+      }
+
+      if (!round) return;
+      aiRounds.value = [...aiRounds.value, round];
+      base = round.grid;
+      if (i === 1) aiRoundIndex.value = 0;
+    }
+  } catch (e) {
+    if (id !== aiReqId) return;
+    aiError.value = String(e);
+  } finally {
+    if (id === aiReqId) {
+      aiBusy.value = false;
+      aiProgress.value = { done: 0, total: 0 };
+    }
+  }
 }
 
 /** 追问：以「当前预览」为基准重建 payload（模型才知道现在的状态），再接进对话 */
 async function runFollowUp() {
   if (aiBusy.value) return;
   const text = aiFollowUp.value.trim();
-  const baseGrid = aiPreview.value;
+  const baseGrid = aiRound.value?.grid;
   if (!text || !aiLastRaw.value || !baseGrid) return;
   const labels = currentLabels();
   const { user } = buildMessages({
@@ -435,7 +527,7 @@ async function runFollowUp() {
 
 /** 把预览结果写入座位图并持久化 */
 function applyAi() {
-  const g = aiPreview.value;
+  const g = aiRound.value?.grid;
   if (!g) return;
   seatGrid.value = g.map((rowsArr, gi) => ({
     label: groupLabel(gi, g.length, reverseGroups.value),
@@ -1129,11 +1221,11 @@ const draftCapacity = computed(
     >
       <div
         class="flex max-h-[88vh] w-[94vw] flex-col rounded-xl bg-panel shadow-2xl"
-        :class="aiPreview ? 'max-w-280' : 'max-w-140'"
+        :class="aiRounds.length > 0 ? 'max-w-280' : 'max-w-140'"
       >
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">
-            {{ aiPreview ? "AI 排座结果预览" : "AI 排座" }}
+            {{ aiRounds.length > 0 ? "AI 排座结果预览" : "AI 排座" }}
           </span>
           <button
             class="rounded p-1 text-muted hover:bg-surface hover:text-title"
@@ -1144,7 +1236,7 @@ const draftCapacity = computed(
         </div>
 
         <!-- 输入态 -->
-        <div v-if="!aiPreview" class="flex min-h-0 flex-col gap-3 overflow-y-auto p-5">
+        <div v-if="aiRounds.length === 0" class="flex min-h-0 flex-col gap-3 overflow-y-auto p-5">
           <textarea
             v-model="aiPrompt"
             rows="5"
@@ -1152,6 +1244,22 @@ const draftCapacity = computed(
             :disabled="aiBusy"
             class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
           ></textarea>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-text">生成次数</label>
+            <input
+              v-model.number="roundsToGenerate"
+              type="number"
+              min="1"
+              max="20"
+              :disabled="aiBusy"
+              class="w-20 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary disabled:opacity-60"
+            />
+            <span class="text-xs text-muted">
+              1~20 次，逐次串行生成；预计 ≈
+              {{ Math.max(1, roundsToGenerate || 1) }} × 每轮耗时（关推理 2~4 秒，
+              开推理 50~80 秒）
+            </span>
+          </div>
           <div class="flex items-center gap-2 text-xs text-muted">
             <template v-if="aiConfigStatus === 'fail'">配置读取失败，见下方错误</template>
             <template v-else-if="aiConfigStatus === 'loading'">正在读取配置…</template>
@@ -1174,7 +1282,10 @@ const draftCapacity = computed(
           <div v-if="aiBusy" class="flex flex-col gap-1.5">
             <div class="flex items-center gap-1.5 text-xs font-medium text-title">
               <LoaderCircle :size="12" class="animate-spin" />
-              模型思考中…
+              <template v-if="aiProgress.total > 1">
+                第 {{ aiProgress.done }} / {{ aiProgress.total }} 次 · 模型思考中…
+              </template>
+              <template v-else>模型思考中…</template>
             </div>
             <div
               ref="thinkBoxRef"
@@ -1211,9 +1322,9 @@ const draftCapacity = computed(
 
               <!-- 组；座位可直接拖拽对调，调完「应用到座位图」按调完的结果落座 -->
               <div class="flex items-start gap-5" :class="teacherView ? 'order-1 rotate-180' : ''">
-                <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
+                <div v-for="(g, gi) in aiRound?.grid ?? []" :key="gi" class="flex flex-col items-center gap-1.5">
                   <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
-                    {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
+                    {{ groupLabel(gi, aiRound?.grid.length ?? 0, reverseGroups) }}
                   </div>
                   <div class="flex flex-col gap-1.5">
                     <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
@@ -1274,13 +1385,13 @@ const draftCapacity = computed(
               <div
                 class="shrink-0 rounded-lg border border-border bg-panel p-2.5 text-xs leading-relaxed text-text"
               >
-                {{ aiSummary || "（无）" }}
+                {{ aiRound?.summary || "（无）" }}
               </div>
               <div class="text-xs font-medium text-title">为什么这么排</div>
               <div
                 class="min-h-0 flex-1 overflow-y-auto rounded-lg bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
               >
-                {{ aiReason || "（模型未给出说明）" }}
+                {{ aiRound?.reason || "（模型未给出说明）" }}
               </div>
               <!-- 出结果后思考过程默认收起：原生 details，不用自己维护展开状态 -->
               <details
@@ -1307,7 +1418,7 @@ const draftCapacity = computed(
         </div>
 
         <!-- 追问：接着上一轮继续提要求并重排 -->
-        <div v-if="aiPreview" class="flex shrink-0 items-end gap-2 border-t border-border px-5 py-3">
+        <div v-if="aiRounds.length > 0" class="flex shrink-0 items-end gap-2 border-t border-border px-5 py-3">
           <textarea
             v-model="aiFollowUp"
             rows="2"
@@ -1326,7 +1437,7 @@ const draftCapacity = computed(
         </div>
 
         <div class="flex justify-end gap-2 border-t border-border px-5 py-3">
-          <template v-if="!aiPreview">
+          <template v-if="aiRounds.length === 0">
             <button
               class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
               @click="closeAi"
@@ -1339,7 +1450,7 @@ const draftCapacity = computed(
               @click="runAi"
             >
               <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
-              {{ aiBusy ? "排座中…" : "开始排座" }}
+              {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${Math.max(1, roundsToGenerate || 1)} 次）` }}
             </button>
           </template>
           <template v-else>
