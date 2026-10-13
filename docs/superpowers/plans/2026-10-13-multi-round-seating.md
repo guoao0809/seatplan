@@ -1505,7 +1505,23 @@ git commit -m "feat(ai): 预览轮播、追问范围、应用整组与批量存�
 ### Task 10: 收尾验证
 
 **Files:**
-- 无代码改动（除非验证发现问题）
+- Modify: `src/views/SeatView.vue`（仅 Step 0 的三处清理）
+
+**关于 GUI**：老师已裁定**自己验收界面**，控制者不做截屏、不做 GUI 操作。本任务只跑不需要屏幕的部分，并**交付一张逐条清单**（见 Step 5）供老师照着看。
+
+- [ ] **Step 0: 三处收尾清理（Task 12 审查带出，同一个文件）**
+
+1. **「生成次数」右侧说明文案已过期**——它现在写「1~20 次，逐次串行生成；预计 ≈ N × 每轮耗时（关推理 2~4 秒，开推理 50~80 秒）」，但改成一次调用后**没有"N ×"这回事**，而且这行字正是老师点按钮前判断耗时的依据，写错就是误导。改成：
+
+```vue
+            <span class="text-xs text-muted">
+              1~20 次，一次生成全部座位图；预计一次调用耗时（关推理 2~4 秒，开推理 50~80 秒）
+            </span>
+```
+
+2. **删掉死状态 `aiProgress`**：一次调用没有逐轮进度，它现在只写不读（两个显示点已改成「正在生成 N 次」，不再依赖它）。删掉声明、`runAi` 里的赋值、`resetAiRun` 里的复位、以及 `finally` 里那行。
+
+3. **两处注释仍称 `runAi` 为「链式生成」**（`runFollowUp` / `runFollowUpAll` 上方），说法已不成立，改成「一次生成 N 次」。
 
 - [ ] **Step 1: 全量自检**
 
@@ -1514,32 +1530,35 @@ Run:
 cd /d/wok/worknotes/seatplan && node src/lib/seat.ts && node src/lib/ai.ts && node src/lib/rotation.ts
 cd /d/wok/worknotes/seatplan/src-tauri && cargo test
 ```
-Expected: 三个「自检通过」 + cargo 测试全绿（含 `sse_line_*`、`config_save_path*`）
+Expected: 三个「自检通过」 + cargo 测试全绿（14 passed）
 
-- [ ] **Step 2: 类型检查**
+- [ ] **Step 2: 类型检查与构建**
 
-Run: `cd /d/wok/worknotes/seatplan && npx vue-tsc --noEmit`
-Expected: 无错误（既有 tsconfig 的 `baseUrl` 弃用警告不算）
+Run: `cd /d/wok/worknotes/seatplan && npx vue-tsc --noEmit && pnpm build`
+Expected: 两条都退出码 0
 
-- [ ] **Step 3: 兼容性回归（最重要的一条）**
-
-Run: `cd /d/wok/worknotes/seatplan && npm run tauri dev`
-Expected:
-- 全新状态（清掉 localStorage）→ 单张排座、拖拽、导出图片、记录回显、AI 单次排座全部照旧，界面里**看不到任何箭头**；
-- 旧数据：把 `seatplan:rounds` 手动删掉，`seatplan:grid` 还在 → 依然能正常显示单张。
-
-- [ ] **Step 4: 中断测试**
-
-生成 3 轮中途点 X。
-Expected: 弹窗关闭、无迟到结果回写、再打开弹窗不残留上一轮状态；`aiBusy` 恢复。
-
-- [ ] **Step 5: Commit（若有修补）**
+- [ ] **Step 3: 提交**
 
 ```bash
 cd /d/wok/worknotes/seatplan
-git add -A
-git commit -m "chore: 多次排座收尾验证修补"
+git add src/views/SeatView.vue
+git commit -m "chore(seat): 收尾清理——修正耗时说明、删除死状态 aiProgress、订正注释"
 ```
+
+- [ ] **Step 4: 交给老师一份逐条验收清单**
+
+不写进代码，作为交付信息给出（每条：在哪个界面看什么 / 预期现象 / 不对时对应哪段代码）：
+
+1. **单张场景（N=1）不看箭头**——「设置」里把次数设成 1 → 排座 → 主页座位图两侧**不应出现任何箭头**，拖拽换座、导出图片、记录回显照旧。对应 `RoundSwitcher` 的 `total <= 1` 分支与 `SeatView` 的 `seatRounds`。
+2. **一次生成 N 次**——次数设 8 → 排座 → 只调一次模型（思考过程只有一段、耗时接近单次调用），生成完预览态出现「第 1 / 8 次」与左右箭头。
+3. **轮播首末禁用**——第 1 次时左箭头灰、第 8 次时右箭头灰。
+4. **异常轮标黄**——如果某次生成没拆开「不能同桌」的学生，轮播切到那一轮时右上「⚠ 有学生没拆开」+ 右栏红框提示。
+5. **应用整组**——点「应用到座位图」→ 主页出现同一组 8 张、可左右切；切到第 3 张拖拽换座后，切走再切回改动还在，其它张不变。
+6. **批量存记录**——「全部存入记录」→ 记录页出现 8 条带「第 N 次」徽标的记录。
+7. **追问两种范围**——追问框旁「当前这次」只改当前显示的那一张；「整体重排」重跑全部 8 张。
+8. **轮换统计表**——预览右栏与主页各有一处可折叠的统计表，有人从没坐过后排时该行标红。
+9. **中断**——生成中点 X / 点「返回修改」：弹窗关闭、不再回写、按钮不卡在「排座中」。
+10. **旧数据**——把 localStorage 里的 `seatplan:rounds` 删掉、`seatplan:grid` 留着 → 仍能正常显示单张。
 
 ---
 
