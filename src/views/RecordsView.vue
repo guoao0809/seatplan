@@ -61,7 +61,15 @@ function fmt(ts: number) {
         class="mb-3 flex items-start justify-between gap-4 rounded-xl border border-border bg-panel p-4"
       >
         <div class="min-w-0">
-          <div class="text-sm text-title">导出时间：{{ fmt(r.exportedAt) }}</div>
+          <div class="text-sm text-title">
+            <span
+              v-if="r.label"
+              class="mr-1.5 rounded bg-primary/10 px-1.5 py-0.5 text-[11px] text-primary"
+            >
+              {{ r.label }}
+            </span>
+            导出时间：{{ fmt(r.exportedAt) }}
+          </div>
           <div class="mt-1 text-xs text-muted">
             共 {{ r.rows.length }} 组 / 每排 {{ r.seatsPerRow }} 座 / 单座：{{ r.singleSeatName || "—" }}
           </div>

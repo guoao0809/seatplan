@@ -6,6 +6,8 @@ export interface SeatRecord {
   rows: number[];
   /** 各组配色；早期记录没有此字段，回退默认调色板 */
   colors?: string[];
+  /** 多次排座时的轮次说明，如「第 3 次」；单张记录没有此字段 */
+  label?: string;
   seatsPerRow: number;
   singleSeatName: string;
   /** 座位网格（组 → 排 → 座 → 姓名或 null） */
