@@ -594,9 +594,13 @@ git commit -m "feat(ai): payload 带上程序算的轮换计分表 roundStats"
 ```vue
 <script setup lang="ts">
 // 轮播外壳：左右箭头夹着内容，上面一行显示「第 i / N 次」。
-// total <= 1 时退化成纯容器——单张座位图的场景看不出任何变化。
+//
+// total <= 1 时**直接渲染插槽本身、不套任何包裹元素**——单张座位图的场景要在 DOM 上与
+// 改动前逐字一致，不能只是「看起来一样」。
+//
+// 调用方需保证 index ∈ [0, total)；组件内部再钳一层兜底，避免越界时显示「第 5 / 3 次」。
 import { computed } from "vue";
-import { ChevronLeft, ChevronRight } from "lucide-vue-next";
+import { ChevronLeft, ChevronRight, TriangleAlert } from "lucide-vue-next";
 
 const props = withDefaults(
   defineProps<{ index: number; total: number; warn?: boolean }>(),
@@ -605,11 +609,15 @@ const props = withDefaults(
 const emit = defineEmits<{ change: [index: number] }>();
 
 const multi = computed(() => props.total > 1);
-const atStart = computed(() => props.index <= 0);
-const atEnd = computed(() => props.index >= props.total - 1);
+/** 越界不抛错、按边界钳住：宁可显示首/末页，也不要出现「第 5 / 3 次」这种标题 */
+const pos = computed(() =>
+  props.total > 0 ? Math.min(Math.max(props.index, 0), props.total - 1) : 0,
+);
+const atStart = computed(() => pos.value <= 0);
+const atEnd = computed(() => pos.value >= props.total - 1);
 
 function go(step: number) {
-  const next = props.index + step;
+  const next = pos.value + step;
   if (next < 0 || next > props.total - 1) return;
   emit("change", next);
 }
@@ -619,19 +627,36 @@ const ARROW =
 </script>
 
 <template>
-  <div class="flex flex-col gap-2">
-    <div v-if="multi" class="flex items-center justify-center gap-2 text-xs text-muted">
-      <span>第 {{ index + 1 }} / {{ total }} 次</span>
-      <span v-if="warn" class="text-red-500">⚠ 有学生没拆开</span>
+  <!-- 单张：原样透出插槽，DOM 上不多一层 -->
+  <slot v-if="!multi" />
+  <div v-else class="flex flex-col gap-2">
+    <div class="flex items-center justify-center gap-2 text-xs text-muted">
+      <span>第 {{ pos + 1 }} / {{ total }} 次</span>
+      <span v-if="warn" class="flex items-center gap-1 text-red-500">
+        <TriangleAlert :size="12" />
+        有学生没拆开
+      </span>
     </div>
     <div class="flex items-center gap-3">
-      <button v-if="multi" :class="ARROW" :disabled="atStart" title="上一次" @click="go(-1)">
+      <button
+        :class="ARROW"
+        :disabled="atStart"
+        aria-label="上一次座位"
+        title="上一次"
+        @click="go(-1)"
+      >
         <ChevronLeft :size="17" />
       </button>
       <div class="min-w-0 flex-1">
         <slot />
       </div>
-      <button v-if="multi" :class="ARROW" :disabled="atEnd" title="下一次" @click="go(1)">
+      <button
+        :class="ARROW"
+        :disabled="atEnd"
+        aria-label="下一次座位"
+        title="下一次"
+        @click="go(1)"
+      >
         <ChevronRight :size="17" />
       </button>
     </div>
@@ -1190,8 +1215,14 @@ git commit -m "feat(ai): 一次生成 N 轮链式排座（含硬约束逐轮校�
 在「为什么这么排」那块之后、`<details>` 思考过程之前插入：
 
 ```vue
-              <div v-if="aiRound?.warnings.length" class="shrink-0 rounded-lg bg-red-50 p-2.5 text-xs text-red-600">
-                ⚠ {{ aiRound.warnings.join("；") }}（已重试 2 次仍未能拆开，请手动调整）
+              <div
+                v-if="aiRound?.warnings.length"
+                class="flex shrink-0 items-start gap-1.5 rounded-lg bg-red-50 p-2.5 text-xs text-red-600"
+              >
+                <TriangleAlert :size="14" class="mt-px shrink-0" />
+                <span>
+                  {{ aiRound.warnings.join("；") }}（已重试 2 次仍未能拆开，请手动调整）
+                </span>
               </div>
               <details class="shrink-0 rounded-lg border border-border bg-surface">
                 <summary class="cursor-pointer px-2.5 py-1.5 text-xs text-muted hover:text-title">
@@ -1214,6 +1245,8 @@ const fairnessRows = computed(() =>
   fairnessReport(aiRounds.value.map((r) => r.grid), roster.value),
 );
 ```
+
+并在 `SeatView.vue` 顶部已有的 lucide 图标 import 列表里加上 `TriangleAlert`（警告框用图标而不是 `⚠` 文本字符，与全项目图标风格一致）。
 
 - [ ] **Step 3: 追问范围**
 
