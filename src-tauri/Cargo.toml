@@ -1,6 +1,6 @@
 [package]
 name = "seatplan"
-version = "0.2.0"
+version = "0.3.0"
 description = "教室排座"
 authors = ["you"]
 edition = "2021"
