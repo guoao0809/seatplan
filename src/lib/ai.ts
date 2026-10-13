@@ -54,6 +54,54 @@ export interface ArrangeInput {
   history: Grid[];
   /** 用户的自然语言要求 */
   instruction: string;
+  /** 学生档案（特点 / 注意事项），排座时需照顾到的个体需求 */
+  students?: StudentNote[];
+}
+
+/** 一个学生的特点与注意事项；name 与网格里的姓名对应 */
+export interface StudentNote {
+  name: string;
+  /** 学生特点，如「近视」「好动」 */
+  trait?: string;
+  /** 注意事项，如「不能和 X 同桌」 */
+  note?: string;
+}
+
+/** 一对同桌：两个座位 + 两人的档案（空位为 null）。模型据此判断「谁跟谁同桌」，不必自己数坐标 */
+export interface DeskPair {
+  /** 两个座位的坐标 [组,排,座]，可直接填进 swapSeats 的 a / b */
+  seats: [SeatRef, SeatRef];
+  /** 同桌两人；空位是 null */
+  students: (StudentNote | null)[];
+}
+
+/**
+ * 「同桌」的定义：**同一排里从左到右两两成对**（第 1-2 座、第 3-4 座…）。
+ * 每排奇数座时最后一个落单，没有同桌。两人都空的排不进列表。
+ *
+ * 这活必须由程序干：之前把它留给模型，模型要在 60 个名字的嵌套数组里自己数坐标，
+ * 于是频繁给出「把同桌 A 换成同桌 B」这种合法但等于没换的操作。
+ */
+export function deskPairsOf(grid: Grid, students: StudentNote[] = []): DeskPair[] {
+  const byName = new Map(students.filter((s) => s.name).map((s) => [s.name, s]));
+  const profile = (name: string | null): StudentNote | null => {
+    if (!name) return null;
+    const s = byName.get(name);
+    return { name, ...(s?.trait ? { trait: s.trait } : {}), ...(s?.note ? { note: s.note } : {}) };
+  };
+
+  const pairs: DeskPair[] = [];
+  grid.forEach((rows, gi) =>
+    rows.forEach((row, ri) => {
+      for (let si = 0; si + 1 < row.length; si += 2) {
+        const a = profile(row[si] ?? null);
+        const b = profile(row[si + 1] ?? null);
+        if (!a && !b) continue; // 两人都空，没信息可给
+        pairs.push({ seats: [[gi, ri, si], [gi, ri, si + 1]], students: [a, b] });
+      }
+    }),
+  );
+  return pairs;
 }
 
 export type ParseResult =
@@ -88,6 +136,10 @@ const SYSTEM_PROMPT = [
   "坐标一律用**数组下标**（从 0 开始），分别指 current 的第几组、第几排、第几个座。",
   "groups[i] 是第 i 组在用户屏幕上显示的名字。",
   "",
+  "【同桌】同桌 = **同一排里从左到右两两成对的两个座位**（第 1-2 座、第 3-4 座…，每排共 shape.seatsPerRow 座）。",
+  "payload 里的 deskPairs 已经把**当前所有同桌对**连同两人的特点/注意事项算好了，空位是 null。",
+  "判断「谁跟谁同桌」一律查 deskPairs，**不要自己从 current 里数坐标**——那是你最容易出错的地方。",
+  "",
   "硬性规则：",
   "1. 只返回 JSON，不要解释文字，不要 markdown 代码块围栏。",
   "2. 下标必须在范围内：组 < current.length，排 < current[组].length，座 < current[组][排].length。",
@@ -96,17 +148,35 @@ const SYSTEM_PROMPT = [
   "5. ops 至少要有 1 个操作。",
   "6. reason 只说思路（为什么这样更公平 / 为什么这么调），不要罗列操作细节。",
   "7. 用户追问时，current 已经是上一轮调整后的结果，你基于它继续给出新的操作。",
+  "8. students 是学生档案（可为空），给出部分学生的特点（trait）与注意事项（note）。排座要照顾到它们：",
+  "   近视 / 个子矮靠前，好动 / 话多分开，需要单独坐的排到边缘或单座，写明「不能同桌」的绝不排一起。",
+  "   照顾不到时在 reason 里说明，不要假装做到了。",
+  "9. 约束涉及同桌时（「A 不能和 B 同桌」「有同样特点的不能同桌」等），必须拿 deskPairs **逐对过一遍**：",
+  "   凡违反的对，都要用 swapSeats 把其中一人换到一个不会制造新违规的座位去。",
+  "   注意 deskPairs 的每一对里，两个座位**本来就是同桌**——把它们两个对调等于什么都没做，这是最常见的错误。",
+  "   下完操作后自己再核对一遍：deskPairs 里不该再有任何一对违反用户约束。",
+  "10. 思考过程一律用中文写（给用户看的），不要用英文。",
 ].join("\n");
 
 /** 构造首轮的 system + user 消息 */
 export function buildMessages(input: ArrangeInput): { system: string; user: string } {
   const inGrid = flattenNames(input.grid);
+  // 只把填了内容的档案发给模型，空档案不上行（60 人的班级大半是空的）
+  const students = (input.students ?? [])
+    .map((s) => ({
+      name: s.name,
+      ...(s.trait ? { trait: s.trait } : {}),
+      ...(s.note ? { note: s.note } : {}),
+    }))
+    .filter((s) => Object.keys(s).length > 1);
   const payload = {
     instruction: input.instruction,
     shape: { rows: rowCounts(input.grid), seatsPerRow: input.grid[0]?.[0]?.length ?? 0 },
     groups: input.labels,
     singleSeat: input.singleSeatName || null,
     roster: input.singleSeatName ? [...inGrid, input.singleSeatName] : inGrid,
+    ...(students.length > 0 ? { students } : {}),
+    deskPairs: deskPairsOf(input.grid, input.students ?? []),
     current: input.grid,
     history: input.history,
   };
@@ -504,6 +574,86 @@ export function runAiSelfCheck(): void {
     must(JSON.stringify(p.groups) === JSON.stringify(labels), "groups 应原样透传");
     must(JSON.stringify(p.shape.rows) === JSON.stringify([2, 3]), "shape.rows 应为各组排数");
     must(!system.includes("座位表本身") === false, "系统提示应说明不输出座位表");
+    must(system.includes("deskPairs"), "系统提示应告诉模型优先查 deskPairs 而不是自己数坐标");
+    must(system.includes("思考过程一律用中文"), "系统提示应要求思考过程用中文");
+
+    // 学生档案：空档案不上行，填了的原样带上
+    const withNotes = JSON.parse(
+      buildMessages({
+        grid: base,
+        labels,
+        singleSeatName: "",
+        history: [],
+        instruction: "排座",
+        students: [
+          { name: "甲", trait: "近视" },
+          { name: "乙", trait: "", note: "" },
+          { name: "丙", note: "不能和 甲 同桌" },
+        ],
+      }).user,
+    ) as { students?: { name: string; trait?: string; note?: string }[] };
+    must(
+      JSON.stringify(withNotes.students) ===
+        JSON.stringify([
+          { name: "甲", trait: "近视" },
+          { name: "丙", note: "不能和 甲 同桌" },
+        ]),
+      `students 应只带填了内容的档案，实际：${JSON.stringify(withNotes.students)}`,
+    );
+    const noNotes = JSON.parse(
+      buildMessages({ grid: base, labels, singleSeatName: "", history: [], instruction: "排座" }).user,
+    ) as { students?: unknown; deskPairs: DeskPair[] };
+    must(!("students" in noNotes), "没有档案时不应出现 students 字段");
+
+    // deskPairs：同桌对由程序算好——每排一组相邻两座，带上两人的档案，空位是 null，双空排不出现
+    const pairs = noNotes.deskPairs;
+    must(pairs.length === 5, `base 有 2+3 排共 5 对同桌，实际 ${pairs.length}`);
+    must(
+      JSON.stringify(pairs[0]!.seats) === JSON.stringify([
+        [0, 0, 0],
+        [0, 0, 1],
+      ]),
+      `首对应为第一组第一排的两个座位，实际 ${JSON.stringify(pairs[0]!.seats)}`,
+    );
+    must(
+      JSON.stringify(pairs[0]!.students.map((s) => s?.name)) === JSON.stringify(["a1", "a2"]),
+      `首对应带出同桌两人的姓名，实际 ${JSON.stringify(pairs[0]!.students)}`,
+    );
+    must(
+      JSON.stringify(pairs[4]!.seats) === JSON.stringify([
+        [1, 2, 0],
+        [1, 2, 1],
+      ]),
+      `末对应为第二组第三排，实际 ${JSON.stringify(pairs[4]!.seats)}`,
+    );
+
+    // 档案要跟着同桌对上到人头上：同桌过的才带 trait / note
+    const withDesk = JSON.parse(
+      buildMessages({
+        grid: [[["a1", "a2"]]],
+        labels: ["第一组"],
+        singleSeatName: "",
+        history: [],
+        instruction: "排座",
+        students: [{ name: "a2", trait: "爱抠鼻屎" }],
+      }).user,
+    ) as { deskPairs: DeskPair[] };
+    must(
+      JSON.stringify(withDesk.deskPairs[0]!.students) ===
+        JSON.stringify([{ name: "a1" }, { name: "a2", trait: "爱抠鼻屎" }]),
+      `同桌对应带出各自档案，实际 ${JSON.stringify(withDesk.deskPairs[0]!.students)}`,
+    );
+
+    // 空位是 null；两人都空的排不进列表；奇数座时最后一个落单不算同桌
+    const sparse = deskPairsOf([[["a1", null], [null, null], ["b1", "b2", "c1"]]]);
+    must(
+      JSON.stringify(sparse.map((d) => d.students)) ===
+        JSON.stringify([
+          [{ name: "a1" }, null],
+          [{ name: "b1" }, { name: "b2" }],
+        ]),
+      `空位 / 双空排 / 落单座的处理不对，实际 ${JSON.stringify(sparse.map((d) => d.students))}`,
+    );
   }
 
   // ---- appendFollowUp ----
@@ -528,10 +678,40 @@ export async function loadAiConfig(): Promise<LoadedAiConfig> {
   return invoke<LoadedAiConfig>("load_ai_config");
 }
 
-/** 调 AI 排座，返回模型输出的原始文本 */
-export async function arrangeSeats(config: AiConfig, messages: ChatMessage[]): Promise<string> {
+/** 测试连接，成功返回耗时字符串（如 "0.8s"） */
+export async function testAiConnection(config: AiConfig): Promise<string> {
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<string>("ai_arrange", { config, messages });
+  return invoke<string>("test_ai_connection", { config });
+}
+
+/** 拉模型列表（GET {base}/v1/models） */
+export async function listModels(config: AiConfig): Promise<string[]> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string[]>("fetch_models", { config });
+}
+
+/** 保存配置到配置文件，返回实际写入的路径 */
+export async function saveAiConfig(path: string, config: AiConfig): Promise<string> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("save_ai_config", { path, config });
+}
+
+/** 流式增量：reasoning 是模型的思考过程，content 是正文（最终那串 JSON 操作）的片段 */
+export interface AiStreamEvent {
+  kind: "reasoning" | "content";
+  text: string;
+}
+
+/** 调 AI 排座：流式回推增量，最终返回拼好的原始文本 */
+export async function arrangeSeats(
+  config: AiConfig,
+  messages: ChatMessage[],
+  onEvent: (e: AiStreamEvent) => void,
+): Promise<string> {
+  const { invoke, Channel } = await import("@tauri-apps/api/core");
+  const channel = new Channel<AiStreamEvent>();
+  channel.onmessage = onEvent;
+  return invoke<string>("ai_arrange", { config, messages, onEvent: channel });
 }
 
 // 自检也可用 node 直接跑：`node --experimental-strip-types src/lib/ai.ts`

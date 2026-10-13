@@ -3,7 +3,7 @@
 mod ai;
 
 use ai::AiConfig;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 #[derive(serde::Serialize)]
@@ -75,6 +75,39 @@ fn load_ai_config(app: tauri::AppHandle) -> Result<LoadedAiConfig, String> {
     Err(format!("未找到 config.json，已查找：\n{searched}"))
 }
 
+/// 决定把配置写回哪个文件：优先写回加载时用的那个（可能是源码目录或 exe 同目录）；
+/// 加载时压根没有文件（走的是构建期内置兜底，path 会是「（安装包内置）」）则落到 AppData——
+/// 那个目录本来就在 load_ai_config 的查找链里，下次启动能读到。
+fn config_save_path(loaded_path: &str, app_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let loaded = Path::new(loaded_path);
+    if loaded.is_file() {
+        return Ok(loaded.to_path_buf());
+    }
+    app_dir
+        .map(|dir| dir.join("config.json"))
+        .ok_or_else(|| "没找到配置文件，也定位不到 AppData 目录".to_string())
+}
+
+/// 设置页保存 AI 配置，返回实际写入的路径（前端用它更新「配置来源」那行字）。
+#[tauri::command]
+fn save_ai_config(
+    app: tauri::AppHandle,
+    path: String,
+    config: AiConfig,
+) -> Result<String, String> {
+    let app_dir = app.path().app_config_dir().ok();
+    let target = config_save_path(&path, app_dir.as_deref())?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建配置目录 {} 失败：{e}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("序列化配置失败：{e}"))?;
+    std::fs::write(&target, format!("{text}\n"))
+        .map_err(|e| format!("写入 {} 失败：{e}", target.display()))?;
+    Ok(target.display().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -82,8 +115,39 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             save_png,
             load_ai_config,
-            ai::ai_arrange
+            save_ai_config,
+            ai::ai_arrange,
+            ai::test_ai_connection,
+            ai::fetch_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_path_reuses_the_loaded_file() {
+        let dir = std::env::temp_dir().join("seatplan-save-path-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(
+            config_save_path(&file.display().to_string(), None).unwrap(),
+            file
+        );
+    }
+
+    #[test]
+    fn save_path_falls_back_to_app_dir_for_embedded_config() {
+        let app = PathBuf::from("/tmp/seatplan-appdata");
+        assert_eq!(
+            config_save_path("（安装包内置）", Some(&app)).unwrap(),
+            app.join("config.json")
+        );
+        // 既没文件也没 AppData → 明确报错，而不是写到一个瞎猜的路径
+        assert!(config_save_path("（安装包内置）", None).is_err());
+    }
 }

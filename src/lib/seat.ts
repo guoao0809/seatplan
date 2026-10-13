@@ -78,6 +78,54 @@ export function parseRoster(text: string): string[] {
     .filter(Boolean);
 }
 
+/** 名单一行：姓名 + 学生特点 + 注意事项 */
+export interface RosterRow {
+  name: string;
+  trait: string;
+  note: string;
+}
+
+/** 由姓名列表生成名单行（特点 / 注意事项留空） */
+export function toRosterRows(names: string[]): RosterRow[] {
+  return names.map((name) => ({ name, trait: "", note: "" }));
+}
+
+/**
+ * 解析名单表格的批量粘贴文本：每行一个学生，列间用空格 / 逗号 / 顿号 / 分号 / 制表符分隔。
+ * 超过三列时多余部分并进注意事项（而不是丢掉），只给姓名时后两列留空。
+ */
+export function parseRosterTable(text: string): RosterRow[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name = "", trait = "", ...rest] = line.split(/[,，、;；\t ]+/);
+      return { name, trait, note: rest.join(" ").trim() };
+    })
+    .filter((r) => r.name);
+}
+
+/** 读取持久化的名单：新格式是 JSON 行数组，老格式是纯文本姓名表（迁移成只有姓名一列） */
+export function loadRoster(raw: string): RosterRow[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.map((r) => {
+        const row = r as Partial<RosterRow> | null;
+        return {
+          name: String(row?.name ?? ""),
+          trait: String(row?.trait ?? ""),
+          note: String(row?.note ?? ""),
+        };
+      });
+    }
+  } catch {
+    /* 老格式：不是 JSON，走下面的纯文本迁移 */
+  }
+  return toRosterRows(parseRoster(raw));
+}
+
 /** 解析旧版「每组排数」文本（如 "7,7,8,8"）。仅用于迁移老配置，新配置已改为表格。 */
 export function parseRows(text: string): number[] {
   const nums = text
@@ -204,6 +252,25 @@ export function runSelfCheck(): void {
   if (safeColor("red", 2) !== paletteColor(2)) throw new Error("safeColor 应拒绝非 hex 值");
   if (safeColor(undefined, 1) !== paletteColor(1)) throw new Error("safeColor 应处理 undefined");
   if (safeColor("#AABBCC", 0) !== "#AABBCC") throw new Error("safeColor 应保留合法值");
+
+  // 名单表格：按行解析三列
+  const table = parseRosterTable("张三 好动 需坐前排\n李四，近视，不能和 王五 同桌\n王五\n\n");
+  if (table.length !== 3) throw new Error(`批量粘贴应解析出 3 行，实际 ${table.length}`);
+  if (table[0]!.trait !== "好动" || table[0]!.note !== "需坐前排")
+    throw new Error(`第一行应解析出特点与注意事项，实际 ${JSON.stringify(table[0])}`);
+  if (table[1]!.note !== "不能和 王五 同桌")
+    throw new Error(`超过三列的内容应并进注意事项，实际「${table[1]!.note}」`);
+  if (table[2]!.trait !== "" || table[2]!.note !== "")
+    throw new Error("只给姓名时后两列应为空");
+
+  // 名单持久化：老纯文本迁移成只有姓名一列，新 JSON 原样读回
+  const legacy = loadRoster("张三\n李四,王五");
+  if (legacy.map((r) => r.name).join() !== "张三,李四,王五")
+    throw new Error(`老纯文本名单应迁移为三行，实际 ${JSON.stringify(legacy)}`);
+  if (legacy.some((r) => r.trait || r.note)) throw new Error("迁移出的行特点 / 注意事项应为空");
+  const fromJson = loadRoster(JSON.stringify([{ name: "张三", trait: "好动", note: "靠窗" }]));
+  if (fromJson[0]!.trait !== "好动" || fromJson[0]!.note !== "靠窗")
+    throw new Error("JSON 名单应原样读回");
 }
 
 // 自检也可用 node 直接跑：`node --experimental-strip-types src/lib/seat.ts`

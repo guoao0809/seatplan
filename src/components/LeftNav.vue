@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { LayoutGrid, History } from "lucide-vue-next";
+import { LayoutGrid, History, Settings } from "lucide-vue-next";
 
-export type ViewKey = "seat" | "records";
+export type ViewKey = "seat" | "records" | "settings";
 
 defineProps<{ current: ViewKey }>();
 defineEmits<{ change: [key: ViewKey] }>();
@@ -9,6 +9,7 @@ defineEmits<{ change: [key: ViewKey] }>();
 const items: { key: ViewKey; label: string; icon: typeof LayoutGrid }[] = [
   { key: "seat", label: "排座", icon: LayoutGrid },
   { key: "records", label: "记录", icon: History },
+  { key: "settings", label: "设置", icon: Settings },
 ];
 </script>
 

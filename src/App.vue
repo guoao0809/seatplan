@@ -5,6 +5,7 @@ import Toast from "./components/Toast.vue";
 import LeftNav, { type ViewKey } from "./components/LeftNav.vue";
 import SeatView from "./views/SeatView.vue";
 import RecordsView from "./views/RecordsView.vue";
+import SettingsView from "./views/SettingsView.vue";
 import type { RestorePayload } from "./lib/records";
 
 const currentView = ref<ViewKey>("seat");
@@ -28,7 +29,8 @@ function onRestore(p: RestorePayload) {
       <LeftNav :current="currentView" @change="onNav" />
       <main class="min-w-0 flex-1 bg-surface">
         <SeatView v-if="currentView === 'seat'" :restore="restorePayload" />
-        <RecordsView v-else @restore="onRestore" />
+        <RecordsView v-else-if="currentView === 'records'" @restore="onRestore" />
+        <SettingsView v-else />
       </main>
     </div>
     <Toast />

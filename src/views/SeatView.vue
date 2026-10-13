@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from "vue";
 import {
   ClipboardList,
   Eraser,
@@ -21,7 +21,9 @@ import {
   DEFAULT_ROSTER,
   DEFAULT_SEATS_PER_ROW,
   assignSeats,
-  parseRoster,
+  toRosterRows,
+  parseRosterTable,
+  loadRoster,
   parseRows,
   runSelfCheck,
   groupLabel,
@@ -32,6 +34,7 @@ import {
   readableText,
   type Group,
   type GroupConfig,
+  type RosterRow,
 } from "../lib/seat";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
 import {
@@ -54,8 +57,8 @@ const LS_ROSTER = "seatplan:roster";
 const LS_CFG = "seatplan:cfg";
 const LS_GRID = "seatplan:grid";
 
-// 名单文本与配置
-const rosterText = ref(DEFAULT_ROSTER.join("\n"));
+// 名单表格：姓名 + 学生特点 + 注意事项。排座只认姓名，另两列喂给 AI 与座位悬浮提示
+const roster = ref<RosterRow[]>(toRosterRows(DEFAULT_ROSTER));
 const seatsPerRow = ref(DEFAULT_SEATS_PER_ROW);
 // 各组配置：排数 + 配色（配置弹窗里以表格编辑）
 const groupCfgs = ref<GroupConfig[]>(defaultGroupConfigs());
@@ -68,6 +71,9 @@ const teacherView = ref(false);
 // 弹窗开关（名单 / 配置）
 const showRoster = ref(false);
 const showConfig = ref(false);
+// 名单弹窗里的批量粘贴：整段文本导入，省得一行行点「添加」
+const showPaste = ref(false);
+const pasteText = ref("");
 // 配置弹窗的草稿：改它不影响页面，点「完成」才写回上面几个实时配置
 const cfgDraft = ref<GroupConfig[]>([]);
 const draftSeatsPerRow = ref(DEFAULT_SEATS_PER_ROW);
@@ -84,6 +90,8 @@ const aiError = ref("");
 const aiConfigStatus = ref<"loading" | "ok" | "fail">("loading");
 const aiConfig = ref<AiConfig | null>(null);
 const aiPreview = ref<(string | null)[][][] | null>(null);
+/** 预览里被手动拖过座位：此时模型给的「将执行的操作」已经过期 */
+const aiPreviewEdited = ref(false);
 /** 模型给出的「为什么这么排」 */
 const aiReason = ref("");
 /** 模型给出的操作翻成人话，供用户核对（如「交换 第四组第7排第1座 与 …」） */
@@ -94,6 +102,15 @@ const aiFollowUp = ref("");
 const aiMessages = ref<ChatMessage[]>([]);
 /** 上一轮模型原始返回，追问时作为 assistant 消息回灌 */
 const aiLastRaw = ref("");
+/** 本轮模型的思考过程（流式增量累加）；网关不给 reasoning 时一直为空 */
+const aiThinking = ref("");
+/** 思考框：新内容进来就滚到底，不然长思考看不到最新几行 */
+const thinkBoxRef = ref<HTMLElement | null>(null);
+watch(aiThinking, async () => {
+  await nextTick();
+  const el = thinkBoxRef.value;
+  if (el) el.scrollTop = el.scrollHeight;
+});
 
 const aiPreviewNames = computed(() =>
   aiPreview.value ? flattenNames(aiPreview.value).length : 0,
@@ -104,7 +121,13 @@ function currentGrid(): (string | null)[][][] {
   return seatGrid.value.map((g) => g.rows.map((r) => r.seats.map((s) => s.name)));
 }
 
-const nameCount = computed(() => parseRoster(rosterText.value).length);
+/** 名单里填了姓名的行（排座只认这些姓名，顺序即入座顺序） */
+const rosterNames = computed(() => roster.value.map((r) => r.name.trim()).filter(Boolean));
+/** 姓名 → 档案，供座位悬浮提示用 */
+const rosterByName = computed(
+  () => new Map(roster.value.filter((r) => r.name.trim()).map((r) => [r.name.trim(), r])),
+);
+const nameCount = computed(() => rosterNames.value.length);
 const rows = computed(() => groupCfgs.value.map((c) => c.rows));
 const seatCount = computed(() => Math.max(1, Number(seatsPerRow.value) || 1));
 const capacity = computed(() => rows.value.reduce((n, r) => n + r) * seatCount.value);
@@ -153,7 +176,7 @@ function persistGrid() {
 }
 function seedGrid() {
   seatGrid.value = assignSeats(
-    parseRoster(rosterText.value),
+    rosterNames.value,
     groupCfgs.value,
     seatCount.value,
     reverseGroups.value,
@@ -180,10 +203,29 @@ function applySavedGrid() {
 }
 
 // 指针(mouse)拖拽换座：兼容 Tauri WebView2，改用 pointer 事件而非 HTML5 drag 事件
-function onSeatPointerDown(e: PointerEvent, g: number, r: number, s: number) {
+// 主座位图和 AI 预览用的是同一套拖拽逻辑，只是读写落在不同的网格上
+type DragScope = "grid" | "preview";
+const dragScope = ref<DragScope>("grid");
+
+function readSeat(scope: DragScope, g: number, r: number, s: number): string | null {
+  return scope === "grid"
+    ? (seatGrid.value[g]?.rows[r]?.seats[s]?.name ?? null)
+    : (aiPreview.value?.[g]?.[r]?.[s] ?? null);
+}
+function writeSeat(scope: DragScope, g: number, r: number, s: number, name: string | null) {
+  if (scope === "grid") {
+    const seat = seatGrid.value[g]?.rows[r]?.seats[s];
+    if (seat) seat.name = name;
+  } else if (aiPreview.value?.[g]?.[r]) {
+    aiPreview.value[g]![r]![s] = name;
+  }
+}
+
+function onSeatPointerDown(e: PointerEvent, g: number, r: number, s: number, scope: DragScope = "grid") {
   if (e.button !== 0) return; // 仅左键
+  dragScope.value = scope;
   dragFrom.value = { g, r, s };
-  dragName.value = seatGrid.value[g]!.rows[r]!.seats[s]!.name;
+  dragName.value = readSeat(scope, g, r, s);
   ghost.value = { x: e.clientX, y: e.clientY };
   dragging.value = true;
   e.preventDefault(); // 防止拖动时选中文本
@@ -199,6 +241,7 @@ function onPointerMove(e: PointerEvent) {
 }
 function onPointerUp() {
   if (!dragging.value) return;
+  const scope = dragScope.value;
   const from = dragFrom.value;
   const target = dragOverKey.value;
   dragging.value = false;
@@ -209,12 +252,15 @@ function onPointerUp() {
   if (!from || !target) return;
   const [g, r, s] = target.split("-").map(Number);
   if (g === from.g && r === from.r && s === from.s) return;
-  const a = seatGrid.value[from.g]!.rows[from.r]!.seats[from.s]!;
-  const b = seatGrid.value[g]!.rows[r]!.seats[s]!;
-  const t = a.name;
-  a.name = b.name;
-  b.name = t;
-  persistGrid();
+  const t = readSeat(scope, from.g, from.r, from.s);
+  writeSeat(scope, from.g, from.r, from.s, readSeat(scope, g, r, s));
+  writeSeat(scope, g, r, s, t);
+  if (scope === "grid") {
+    persistGrid();
+  } else {
+    // 手动调过之后，模型给的操作说明就对不上了，标注一下别误导
+    aiPreviewEdited.value = true;
+  }
   playSwap(seatKey(from.g, from.r, from.s), target);
 }
 
@@ -263,6 +309,8 @@ function closeAi() {
 /** 清空一次排座的全部中间状态（预览、理由、对话、追问框） */
 function resetAiRun() {
   aiPreview.value = null;
+  aiPreviewEdited.value = false;
+  aiThinking.value = "";
   aiReason.value = "";
   aiSummary.value = "";
   aiError.value = "";
@@ -278,8 +326,12 @@ async function callAi(msgs: ChatMessage[], baseGrid: Grid, labels: string[]): Pr
   const id = ++aiReqId;
   aiBusy.value = true;
   aiError.value = "";
+  aiThinking.value = "";
   try {
-    const text = await arrangeSeats(cfg, msgs);
+    const text = await arrangeSeats(cfg, msgs, (e) => {
+      if (id !== aiReqId) return; // 已作废的请求：别再把它的思考往回写
+      if (e.kind === "reasoning") aiThinking.value += e.text;
+    });
     if (id !== aiReqId) return; // 请求已被 closeAi 作废：丢弃迟到结果，不动 aiBusy
     const res = parseArrangement(text, baseGrid, labels);
     if (!res.ok) {
@@ -289,6 +341,7 @@ async function callAi(msgs: ChatMessage[], baseGrid: Grid, labels: string[]): Pr
     aiMessages.value = msgs;
     aiLastRaw.value = text;
     aiPreview.value = res.grid;
+    aiPreviewEdited.value = false;
     aiReason.value = res.reason;
     aiSummary.value = res.summary;
   } catch (e) {
@@ -325,6 +378,7 @@ async function runAi() {
       .slice(0, 2)
       .map((r) => r.grid),
     instruction: aiPrompt.value.trim(),
+    students: roster.value,
   });
   await callAi(
     [
@@ -349,6 +403,7 @@ async function runFollowUp() {
     singleSeatName: singleSeatName.value,
     history: [],
     instruction: text,
+    students: roster.value,
   });
   await callAi(appendFollowUp(aiMessages.value, aiLastRaw.value, user), baseGrid, labels);
   if (!aiError.value) aiFollowUp.value = "";
@@ -377,18 +432,50 @@ function setView(teacher: boolean) {
 }
 
 function fillSample() {
-  rosterText.value = DEFAULT_ROSTER.join("\n");
+  roster.value = toRosterRows(DEFAULT_ROSTER);
   showToast("已填入示例名单", "success");
 }
 function clearAll() {
-  rosterText.value = "";
+  roster.value = [];
   showToast("已清空名单", "info");
+}
+
+/** 表格增删行 */
+function addRosterRow() {
+  roster.value.push({ name: "", trait: "", note: "" });
+}
+function removeRosterRow(index: number) {
+  roster.value.splice(index, 1);
+}
+
+/** 批量粘贴：整段文本按「姓名 特点 注意事项」逐行解析，追加到表格末尾 */
+function importRosterText() {
+  const rows = parseRosterTable(pasteText.value);
+  if (rows.length === 0) {
+    showToast("没解析出学生，检查一下每行格式", "info");
+    return;
+  }
+  roster.value.push(...rows);
+  pasteText.value = "";
+  showPaste.value = false;
+  showToast(`已导入 ${rows.length} 人`, "success");
+}
+
+/** 座位悬浮提示：有特点 / 注意事项才提示（原生 title，够用） */
+function seatTip(name: string | null): string | undefined {
+  const r = rosterByName.value.get(name?.trim() ?? "");
+  if (!r) return undefined;
+  const lines = [r.trait && `特点：${r.trait}`, r.note && `注意事项：${r.note}`].filter(Boolean);
+  return lines.length > 0 ? `${r.name}\n${lines.join("\n")}` : undefined;
 }
 
 /** 把某条记录回显到排座页：恢复网格与配置（不依赖名单种子） */
 function applyRestore(p: RestorePayload) {
   const flat = p.grid.flatMap((rows) => rows.flatMap((s) => s));
-  rosterText.value = flat.filter((n) => n !== null).join("\n");
+  // 按姓名把表格里已有的特点 / 注意事项带回来，只补上记录里新出现的姓名
+  roster.value = flat
+    .filter((n): n is string => n !== null && n.trim() !== "")
+    .map((n) => rosterByName.value.get(n.trim()) ?? { name: n, trait: "", note: "" });
   seatsPerRow.value = p.seatsPerRow;
   // 早期记录没有 colors，回退到默认调色板
   groupCfgs.value = toGroupConfigs(p.rows, p.colors);
@@ -473,8 +560,8 @@ watch(
     });
   },
 );
-// 排数/座位数/名单变了才重铺（用字符串比较，避免数组引用变化造成的误触发）
-watch([rosterText, () => rows.value.join(","), seatCount], () => {
+// 姓名或排数/座位数变了才重铺（只改特点/注意事项不动网格，用字符串比较避免数组引用误触发）
+watch([() => rosterNames.value.join("\n"), () => rows.value.join(","), seatCount], () => {
   if (suppressSeed) return;
   seedGrid();
 });
@@ -485,7 +572,7 @@ onMounted(() => {
     runAiSelfCheck();
   }
   const saved = localStorage.getItem(LS_ROSTER);
-  if (saved != null) rosterText.value = saved;
+  if (saved != null) roster.value = loadRoster(saved);
   const cfg = localStorage.getItem(LS_CFG);
   if (cfg) {
     try {
@@ -530,9 +617,9 @@ onBeforeUnmount(() => {
 });
 
 watch(
-  () => JSON.stringify([rosterText.value, seatsPerRow.value, groupCfgs.value, singleSeatName.value, teacherView.value]),
+  () => JSON.stringify([roster.value, seatsPerRow.value, groupCfgs.value, singleSeatName.value, teacherView.value]),
   () => {
-    localStorage.setItem(LS_ROSTER, rosterText.value);
+    localStorage.setItem(LS_ROSTER, JSON.stringify(roster.value));
     localStorage.setItem(
       LS_CFG,
       JSON.stringify({
@@ -672,12 +759,14 @@ const draftCapacity = computed(
       <div ref="seatChartRef" class="mx-auto w-max rounded-xl bg-white p-8 shadow">
         <div class="flex flex-col items-start gap-8">
           <!-- 前排：讲台（左侧）+ 右侧单独座位。老师视角下讲台转到右下角，单座同时换到讲台左侧 -->
+          <!-- 间距必须与下面组行的 gap-10 一致，单座才能正对第二组的左列课桌 -->
           <div
-            class="flex items-stretch gap-6"
+            class="flex items-stretch gap-10"
             :class="teacherView ? 'order-2 self-end flex-row-reverse' : ''"
           >
+            <!-- 讲台宽度 = 两个课桌(24) + 中间间距(2)，右边缘正好对齐第二张桌子 -->
             <div
-              class="flex h-16 w-44 shrink-0 items-center justify-center rounded-lg bg-[#6B4423] shadow"
+              class="flex h-16 w-50 shrink-0 items-center justify-center rounded-lg bg-[#6B4423] shadow"
             >
               <div class="text-sm font-semibold tracking-widest text-[#F5E7D0]">讲 台</div>
             </div>
@@ -717,6 +806,7 @@ const draftCapacity = computed(
                     ]"
                     class="flex h-14 w-24 cursor-grab select-none items-center justify-center rounded-lg text-sm font-medium"
                     :style="seatStyle(g, !!seat.name)"
+                    :title="seatTip(seat.name)"
                     @pointerdown="onSeatPointerDown($event, gi, ri, si)"
                   >
                     {{ seat.name || "—" }}
@@ -746,7 +836,8 @@ const draftCapacity = computed(
     <!-- 拖拽跟手幽灵：尺寸/文字与座位格一致，拖起来像把座位整个拎走 -->
     <div
       v-if="ghost && dragName"
-      class="pointer-events-none fixed z-50 flex h-14 w-24 items-center justify-center rounded-lg bg-[#86C166] text-sm font-medium text-white shadow-lg"
+      class="pointer-events-none fixed z-50 flex items-center justify-center rounded-lg bg-[#86C166] font-medium text-white shadow-lg"
+      :class="dragScope === 'preview' ? 'h-9 w-16 text-xs' : 'h-14 w-24 text-sm'"
       :style="{ left: `${ghost.x}px`, top: `${ghost.y}px`, transform: 'translate(-50%, -50%)' }"
     >
       {{ dragName }}
@@ -756,9 +847,8 @@ const draftCapacity = computed(
     <div
       v-if="showRoster"
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
-      @click.self="showRoster = false"
     >
-      <div class="flex w-105 flex-col rounded-xl bg-panel shadow-2xl">
+      <div class="flex w-176 max-w-[92vw] flex-col rounded-xl bg-panel shadow-2xl">
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
           <span class="text-sm font-medium text-title">学生名单（{{ nameCount }} 人）</span>
           <button
@@ -768,17 +858,89 @@ const draftCapacity = computed(
             <X :size="16" />
           </button>
         </div>
-        <div class="flex flex-col p-5">
-          <textarea
-            v-model="rosterText"
-            rows="12"
-            placeholder="每行一个姓名，或用逗号分隔…"
-            class="h-64 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary"
-          ></textarea>
+        <div class="flex flex-col gap-2 p-5">
+          <!-- 表头：姓名 / 学生特点 / 注意事项 -->
+          <div class="flex items-center gap-2 px-1 text-xs text-muted">
+            <div class="w-24 shrink-0">姓名</div>
+            <div class="flex-1">学生特点</div>
+            <div class="flex-1">注意事项</div>
+            <div class="w-7 shrink-0"></div>
+          </div>
+          <div class="flex max-h-[52vh] min-h-40 flex-col gap-2 overflow-y-auto">
+            <div v-for="(row, i) in roster" :key="i" class="flex items-center gap-2">
+              <input
+                v-model="row.name"
+                placeholder="姓名"
+                class="w-24 shrink-0 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
+              />
+              <input
+                v-model="row.trait"
+                placeholder="如：近视、好动"
+                class="min-w-0 flex-1 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
+              />
+              <input
+                v-model="row.note"
+                placeholder="如：不能和 X 同桌"
+                class="min-w-0 flex-1 rounded-lg border border-border bg-surface px-2.5 py-1.5 text-sm text-title outline-none focus:border-primary"
+              />
+              <button
+                class="w-7 shrink-0 rounded p-1 text-muted hover:bg-surface hover:text-red-500"
+                title="删除这一行"
+                @click="removeRosterRow(i)"
+              >
+                <Trash2 :size="14" />
+              </button>
+            </div>
+            <div v-if="roster.length === 0" class="py-10 text-center text-xs text-muted">
+              名单为空，点下面「添加一行」或「批量粘贴」
+            </div>
+          </div>
+
+          <!-- 批量粘贴：整段文本按行解析，追加到表格末尾 -->
+          <div
+            v-if="showPaste"
+            class="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3"
+          >
+            <textarea
+              v-model="pasteText"
+              rows="5"
+              placeholder="每行一个学生：姓名 学生特点 注意事项（空格或逗号分隔，后两列可留空）"
+              class="resize-none rounded-lg border border-border bg-panel px-2.5 py-1.5 text-sm leading-relaxed text-title outline-none focus:border-primary"
+            ></textarea>
+            <div class="flex items-center gap-2">
+              <div class="mr-auto text-xs text-muted">导入的内容会追加到表格末尾</div>
+              <button
+                class="rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+                @click="showPaste = false"
+              >
+                取消
+              </button>
+              <button
+                class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
+                @click="importRosterText"
+              >
+                导入
+              </button>
+            </div>
+          </div>
         </div>
-        <div class="flex justify-end gap-2 border-t border-border px-5 py-3">
+        <div class="flex items-center gap-2 border-t border-border px-5 py-3">
           <button
             class="flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+            @click="addRosterRow"
+          >
+            <Plus :size="14" />
+            添加一行
+          </button>
+          <button
+            class="flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+            @click="showPaste = !showPaste"
+          >
+            <ClipboardList :size="14" />
+            批量粘贴
+          </button>
+          <button
+            class="ml-auto flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
             @click="clearAll"
           >
             <Eraser :size="14" />
@@ -804,7 +966,6 @@ const draftCapacity = computed(
     <div
       v-if="showConfig"
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
-      @click.self="cancelConfig"
     >
       <div class="flex max-h-[88vh] w-105 flex-col rounded-xl bg-panel shadow-2xl">
         <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
@@ -920,7 +1081,6 @@ const draftCapacity = computed(
     <div
       v-if="showAi"
       class="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
-      @click.self="closeAi"
     >
       <div
         class="flex max-h-[88vh] w-[94vw] flex-col rounded-xl bg-panel shadow-2xl"
@@ -964,58 +1124,140 @@ const draftCapacity = computed(
           >
             {{ aiError }}
           </div>
+
+          <!-- 思考过程：开着推理时一次排座要等 50~80 秒，把模型的思考边到边显示出来 -->
+          <div v-if="aiBusy" class="flex flex-col gap-1.5">
+            <div class="flex items-center gap-1.5 text-xs font-medium text-title">
+              <LoaderCircle :size="12" class="animate-spin" />
+              模型思考中…
+            </div>
+            <div
+              ref="thinkBoxRef"
+              class="max-h-48 min-h-16 overflow-y-auto rounded-lg border border-border bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
+            >
+              {{ aiThinking || "（这次没有思考过程可显示，等它出结果）" }}
+            </div>
+          </div>
         </div>
 
         <!-- 预览态：左座位图（老师视角下与主图一致整块旋转），右「为什么这么排」 -->
         <div v-else class="flex min-h-0 flex-1 gap-5 overflow-hidden p-5">
           <div class="min-w-0 shrink-0 overflow-auto">
-            <div class="flex items-start gap-6" :class="teacherView ? 'rotate-180' : ''">
-              <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
-                <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
-                  {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
+            <div class="flex flex-col items-start gap-4">
+              <!-- 前排：讲台 + 单座，与主图同构（老师视角下整体沉到下方、左右翻转） -->
+              <!-- 间距与下面组行的 gap-5 一致，单座正对第二组左列 -->
+              <div
+                class="flex items-stretch gap-5"
+                :class="teacherView ? 'order-2 self-end flex-row-reverse' : ''"
+              >
+                <!-- 讲台宽度 = 预览里两个课桌(16) + 间距(1.5) = 8.375rem，与主图同一套算法 -->
+                <div
+                  class="flex h-9 w-33.5 shrink-0 items-center justify-center rounded-md bg-[#6B4423] shadow"
+                >
+                  <div class="text-xs font-semibold tracking-widest text-[#F5E7D0]">讲 台</div>
                 </div>
-                <div class="flex flex-col gap-1.5">
-                  <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
-                    <div
-                      v-for="(name, si) in row"
-                      :key="si"
-                      class="flex h-9 w-16 items-center justify-center rounded-md text-xs font-medium"
-                      :class="[
-                        name ? '' : 'bg-surface border border-dashed border-border text-muted',
-                        teacherView ? 'rotate-180' : '',
-                      ]"
-                      :style="name ? { backgroundColor: groupColor(gi), color: readableText(groupColor(gi)) } : {}"
-                    >
-                      {{ name || "—" }}
+                <div
+                  title="单独座位"
+                  class="flex h-9 w-16 shrink-0 items-center justify-center rounded-md bg-[#5B9BD5] text-xs font-medium text-white"
+                >
+                  {{ singleSeatName || "单座" }}
+                </div>
+              </div>
+
+              <!-- 组；座位可直接拖拽对调，调完「应用到座位图」按调完的结果落座 -->
+              <div class="flex items-start gap-5" :class="teacherView ? 'order-1 rotate-180' : ''">
+                <div v-for="(g, gi) in aiPreview" :key="gi" class="flex flex-col items-center gap-1.5">
+                  <div class="text-xs font-medium text-muted" :class="{ 'rotate-180': teacherView }">
+                    {{ groupLabel(gi, aiPreview.length, reverseGroups) }}
+                  </div>
+                  <div class="flex flex-col gap-1.5">
+                    <div v-for="(row, ri) in g" :key="ri" class="flex gap-1.5">
+                      <div
+                        v-for="(name, si) in row"
+                        :key="si"
+                        :data-seat="seatKey(gi, ri, si)"
+                        class="flex h-9 w-16 cursor-grab select-none items-center justify-center rounded-md text-xs font-medium"
+                        :class="[
+                          name ? '' : 'bg-surface border border-dashed border-border text-muted',
+                          teacherView ? 'rotate-180' : '',
+                          dragOverKey === seatKey(gi, ri, si) ? 'ring-2 ring-primary' : '',
+                          swapKeys.includes(seatKey(gi, ri, si)) ? 'seat-swapping' : '',
+                        ]"
+                        :style="name ? { backgroundColor: groupColor(gi), color: readableText(groupColor(gi)) } : {}"
+                        :title="seatTip(name)"
+                        @pointerdown="onSeatPointerDown($event, gi, ri, si, 'preview')"
+                      >
+                        {{ name || "—" }}
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
             </div>
             <div class="mt-4 text-xs text-muted">
-              共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）
+              共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）— 座位可直接拖拽对调
             </div>
           </div>
 
           <div class="flex min-w-0 flex-1 flex-col gap-2 border-l border-border pl-5">
-            <div class="text-xs font-medium text-title">将执行的操作</div>
-            <div
-              class="shrink-0 rounded-lg border border-border bg-panel p-2.5 text-xs leading-relaxed text-text"
-            >
-              {{ aiSummary || "（无）" }}
-            </div>
-            <div class="text-xs font-medium text-title">为什么这么排</div>
-            <div
-              class="min-h-0 flex-1 overflow-y-auto rounded-lg bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
-            >
-              {{ aiReason || "（模型未给出说明）" }}
-            </div>
-            <div
-              v-if="aiError"
-              class="max-h-40 shrink-0 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
-            >
-              {{ aiError }}
-            </div>
+            <!-- 重排时要等 50~80 秒，右栏先让位给思考过程；上一轮的说明此刻也已被推翻 -->
+            <template v-if="aiBusy">
+              <div class="flex items-center gap-1.5 text-xs font-medium text-title">
+                <LoaderCircle :size="12" class="animate-spin" />
+                模型思考中…
+              </div>
+              <div
+                ref="thinkBoxRef"
+                class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
+              >
+                {{ aiThinking || "（这次没有思考过程可显示，等它出结果）" }}
+              </div>
+              <div
+                v-if="aiError"
+                class="max-h-40 shrink-0 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
+              >
+                {{ aiError }}
+              </div>
+            </template>
+            <template v-else>
+              <div class="text-xs font-medium text-title">
+                将执行的操作
+                <span v-if="aiPreviewEdited" class="ml-1 font-normal text-muted">
+                  （你手动调过座位，以下是模型原本的操作）
+                </span>
+              </div>
+              <div
+                class="shrink-0 rounded-lg border border-border bg-panel p-2.5 text-xs leading-relaxed text-text"
+              >
+                {{ aiSummary || "（无）" }}
+              </div>
+              <div class="text-xs font-medium text-title">为什么这么排</div>
+              <div
+                class="min-h-0 flex-1 overflow-y-auto rounded-lg bg-surface p-3 text-xs leading-relaxed whitespace-pre-wrap text-text"
+              >
+                {{ aiReason || "（模型未给出说明）" }}
+              </div>
+              <!-- 出结果后思考过程默认收起：原生 details，不用自己维护展开状态 -->
+              <details
+                v-if="aiThinking"
+                class="shrink-0 rounded-lg border border-border bg-surface"
+              >
+                <summary class="cursor-pointer px-2.5 py-1.5 text-xs text-muted hover:text-title">
+                  模型思考过程（{{ aiThinking.length }} 字）
+                </summary>
+                <div
+                  class="max-h-48 overflow-y-auto px-2.5 pb-2 text-xs leading-relaxed whitespace-pre-wrap text-text"
+                >
+                  {{ aiThinking }}
+                </div>
+              </details>
+              <div
+                v-if="aiError"
+                class="max-h-40 shrink-0 overflow-y-auto rounded-lg bg-red-50 p-3 text-xs leading-relaxed whitespace-pre-wrap text-red-600"
+              >
+                {{ aiError }}
+              </div>
+            </template>
           </div>
         </div>
 
