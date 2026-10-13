@@ -509,6 +509,10 @@ function applyRestore(p: RestorePayload) {
     color: groupColor(gi),
     rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
   }));
+  // 回显一条记录 = 回到单张状态：不重置的话，轮播会继续挂着上一批多轮结果，
+  // 界面显示的却是刚恢复的这张图，点箭头还会跳回一批陈旧的轮次
+  seatRounds.value = [currentGrid()];
+  roundIndex.value = 0;
   persistGrid();
 }
 
