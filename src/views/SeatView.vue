@@ -37,18 +37,14 @@ import {
   type GroupConfig,
   type RosterRow,
 } from "../lib/seat";
-import {
-  deskmateConflicts,
-  fairnessReport,
-  noDeskmatePairs,
-  roundStatsOf,
-} from "../lib/rotation";
+import { deskmateConflicts, fairnessReport, noDeskmatePairs } from "../lib/rotation";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
 import {
   loadAiConfig,
   arrangeSeats,
   buildMessages,
   parseArrangement,
+  parseRoundSets,
   flattenNames,
   appendFollowUp,
   runAiSelfCheck,
@@ -397,21 +393,18 @@ function currentLabels(): string[] {
   return seatGrid.value.map((g) => g.label);
 }
 
-/**
- * 每轮的指令 = 规则原文 + 轮次说明（+ 重试提示）。
- * 必须每轮重述规则：每次调用是全新会话，模型没有跨轮记忆。
- */
-function roundInstruction(i: number, total: number, rule: string, retryHint: string): string {
+/** 一次生成 N 次时的指令：规则原文 + 多轮说明（+ 重试提示） */
+function manyRoundInstruction(rule: string, total: number, retryHint: string): string {
   const lines = [
     rule,
     "",
-    `（这是本学期第 ${i} 次换座，共 ${total} 次。current 是上一次的座位图，按同样的规则继续轮换，不要一次跳到与上一次差异过大的布局。）`,
+    `（请一次给出 ${total} 次换座：rounds 数组正好 ${total} 组，第 1 组以 current 为基准，之后每组接续前一组的结果，整体做到公平轮换。）`,
   ];
   if (retryHint) lines.push(retryHint);
   return lines.join("\n");
 }
 
-/** 一次生成 N 轮：链式——第 1 轮基于当前主页座位图，之后每轮基于上一轮 */
+/** 一次调用拿 N 组操作：第 1 组基于当前主页座位图，之后每组接续前一组 */
 async function runAi() {
   if (aiBusy.value) return;
   if (nameCount.value === 0) {
@@ -436,70 +429,61 @@ async function runAi() {
   aiRounds.value = [];
   aiRoundIndex.value = 0;
 
-  let base = currentGrid();
+  const base = currentGrid();
+  let lastConflict = "";
   try {
-    for (let i = 1; i <= total; i++) {
-      aiProgress.value = { done: i, total };
-      aiThinking.value = ""; // 每轮从头攒思考过程，否则 8 轮的思考会连成一大坨
-      let hint = "";
-      let round: AiRound | null = null;
+    // 一次调用拿 N 组操作；撞硬约束就整组重生成（上限 2 次）
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      const { system, user } = buildMessages({
+        grid: base,
+        labels,
+        singleSeatName: singleSeatName.value,
+        history: [],
+        instruction: `${manyRoundInstruction(rule, total, "")}${lastConflict ? `\n\n注意：${lastConflict}` : ""}`,
+        students: roster.value,
+        rounds: total,
+      });
 
-      // 硬约束：撞了就带提示重跑该轮，最多重试 2 次
-      for (let attempt = 0; attempt <= 2 && !round; attempt++) {
-        const { system, user } = buildMessages({
-          grid: base,
-          labels,
-          singleSeatName: singleSeatName.value,
-          // payload 的 history 约定是「最新在前」，与既有传记录的顺序一致
-          history: aiRounds.value.slice(-3).reverse().map((r) => r.grid),
-          instruction: roundInstruction(i, total, rule, hint),
-          students: roster.value,
-          // 第 1 轮时 aiRounds 还空着，此时基准是主页那张图；第 2 轮起 base 已经躺在 aiRounds 里了，
-          // 再加一次就会把上一轮算两遍、计分表翻倍
-          roundStats: roundStatsOf(
-            aiRounds.value.length ? aiRounds.value.map((r) => r.grid) : [base],
-            roster.value,
-          ),
-        });
-
-        let text = "";
-        const msgs: ChatMessage[] = [
+      const text = await arrangeSeats(
+        cfg,
+        [
           { role: "system", content: system },
           { role: "user", content: user },
-        ];
-        text = await arrangeSeats(cfg, msgs, (e) => {
+        ],
+        (e) => {
           if (id !== aiReqId) return;
           if (e.kind === "reasoning") aiThinking.value += e.text;
-        });
-        if (id !== aiReqId) return; // 已被 closeAi 作废
+        },
+      );
+      if (id !== aiReqId) return; // 已被作废
 
-        const res = parseArrangement(text, base, labels);
-        if (!res.ok) {
-          aiError.value = `第 ${i} 轮校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
-          return;
-        }
-
-        const conflicts = deskmateConflicts(res.grid, pairs);
-        if (conflicts.length === 0) {
-          round = { grid: res.grid, reason: res.reason, summary: res.summary, warnings: [] };
-          break;
-        }
-        if (attempt === 2) {
-          // 重试用尽：保留这轮但标黄，不静默放过、也不因为一对学生毁掉整学期
-          round = {
-            grid: res.grid,
-            reason: res.reason,
-            summary: res.summary,
-            warnings: conflicts.map(([a, b]) => `${a} 与 ${b} 仍同桌`),
-          };
-          break;
-        }
-        hint = `上一版仍把「${conflicts[0]![0]}」和「${conflicts[0]![1]}」排成了同桌，这次必须把他们拆开。`;
+      const res = parseRoundSets(text, base, labels, total);
+      if (!res.ok) {
+        aiError.value = `校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
+        return;
       }
 
-      // 内层循环只有两种出口：round 已赋值，或已直接 return——所以这里不必再判空（! 只为让 TS 认可该不变式）
-      aiRounds.value = [...aiRounds.value, round!];
-      base = round!.grid;
+      // 逐轮查硬约束：任何一轮撞上就整组重生成
+      let conflict: [string, string] | null = null;
+      for (const r of res.rounds) {
+        const hit = deskmateConflicts(r.grid, pairs);
+        if (hit.length > 0) {
+          conflict = hit[0]!;
+          break;
+        }
+      }
+      if (conflict && attempt < 2) {
+        lastConflict = `上一次生成的座位里「${conflict[0]}」和「${conflict[1]}」还是同桌，这次必须把他们拆开。`;
+        continue;
+      }
+
+      aiRounds.value = res.rounds.map((r) => ({
+        grid: r.grid,
+        reason: res.reason,
+        summary: r.summary,
+        warnings: conflict ? [`${conflict[0]} 与 ${conflict[1]} 仍同桌`] : [],
+      }));
+      return;
     }
   } catch (e) {
     if (id !== aiReqId) return;
@@ -1333,7 +1317,7 @@ const draftCapacity = computed(
             class="h-32 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
           ></textarea>
           <div class="flex items-center gap-2">
-            <label class="text-xs text-text">生成次数</label>
+            <label class="shrink-0 whitespace-nowrap text-xs text-text">生成次数</label>
             <input
               v-model.number="roundsToGenerate"
               type="number"
@@ -1370,10 +1354,7 @@ const draftCapacity = computed(
           <div v-if="aiBusy" class="flex flex-col gap-1.5">
             <div class="flex items-center gap-1.5 text-xs font-medium text-title">
               <LoaderCircle :size="12" class="animate-spin" />
-              <template v-if="aiProgress.total > 1">
-                第 {{ aiProgress.done }} / {{ aiProgress.total }} 次 · 模型思考中…
-              </template>
-              <template v-else>模型思考中…</template>
+              正在生成 {{ roundsClamped }} 次换座 · 模型思考中…
             </div>
             <div
               ref="thinkBoxRef"
@@ -1455,10 +1436,7 @@ const draftCapacity = computed(
             <template v-if="aiBusy">
               <div class="flex items-center gap-1.5 text-xs font-medium text-title">
                 <LoaderCircle :size="12" class="animate-spin" />
-                <template v-if="aiProgress.total > 1">
-                  第 {{ aiProgress.done }} / {{ aiProgress.total }} 次 · 模型思考中…
-                </template>
-                <template v-else>模型思考中…</template>
+                正在生成 {{ roundsClamped }} 次换座 · 模型思考中…
               </div>
               <div
                 ref="thinkBoxRef"
@@ -1581,7 +1559,7 @@ const draftCapacity = computed(
               @click="runAi"
             >
               <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
-              {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${roundsClamped} 次）` }}
+              {{ aiBusy ? `排座中（正在生成 ${roundsClamped} 次）…` : `开始排座（${roundsClamped} 次）` }}
             </button>
           </template>
           <template v-else>
