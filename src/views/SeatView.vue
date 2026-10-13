@@ -1007,9 +1007,10 @@ const draftCapacity = computed(
     <div class="min-h-0 flex-1 overflow-auto bg-surface p-6">
       <!-- w-max 不能用 w-fit：fit-content 会被容器宽度夹住，座位溢出到元素盒子外，
            html-to-image 按 clientWidth 量尺寸就会把右侧裁掉 -->
-      <!-- 统计表也放进这个 w-max 容器里，宽度就跟着座位图那块走，而不是撑满整个面板 -->
-      <div class="mx-auto w-max">
       <RoundSwitcher :index="roundIndex" :total="seatRounds.length" @change="showRound">
+        <!-- 统计表与座位图共用这一层 w-max：宽度由座位图决定，统计表跟着它对齐；
+             左右两侧的箭头在 w-max 之外，所以不会把统计表撑宽 -->
+        <div class="mx-auto w-max">
         <div ref="seatChartRef" class="mx-auto w-max rounded-xl bg-white p-8 shadow">
         <div class="flex flex-col items-start gap-8">
           <!-- 前排：讲台（左侧）+ 右侧单独座位。老师视角下讲台转到右下角，单座同时换到讲台左侧 -->
@@ -1071,17 +1072,16 @@ const draftCapacity = computed(
           </div>
         </div>
       </div>
-      </RoundSwitcher>
-
-      <details v-if="seatRounds.length > 1" class="mt-4 rounded-lg border border-border bg-panel">
-        <summary class="cursor-pointer px-3 py-2 text-xs text-muted hover:text-title">
-          轮换统计（共 {{ seatRounds.length }} 次）
-        </summary>
-        <div class="p-3">
-          <FairnessTable :rows="seatFairnessRows" />
+        <details v-if="seatRounds.length > 1" class="mt-4 rounded-lg border border-border bg-panel">
+          <summary class="cursor-pointer px-3 py-2 text-xs text-muted hover:text-title">
+            轮换统计（共 {{ seatRounds.length }} 次）
+          </summary>
+          <div class="p-3">
+            <FairnessTable :rows="seatFairnessRows" />
+          </div>
+        </details>
         </div>
-      </details>
-      </div>
+      </RoundSwitcher>
 
       <!-- 空态：无名单 -->
       <div
