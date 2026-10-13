@@ -16,6 +16,7 @@ import {
   TriangleAlert,
 } from "lucide-vue-next";
 import { toPng } from "html-to-image";
+import { zipSync } from "fflate";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -675,54 +676,100 @@ function dataUrlToBytes(dataUrl: string): Uint8Array {
   return bytes;
 }
 
-/** 导出当前座位图为 PNG（弹「另存为」保存到本地），并把座位 JSON 存入历史记录（不存图片） */
-async function exportImage() {
+/** 导出的进度状态：多轮时按钮上显示「正在导出第 i / N 张…」 */
+const exporting = ref(false);
+const exportProgress = ref({ done: 0, total: 0 });
+
+/**
+ * 把座位图截成 PNG 字节。
+ *
+ * 三个坑照旧（原实现里踩出来的，不要简化）：
+ * 1. pixelRatio 2：默认 1 在高分屏上偏糊；
+ * 2. scrollWidth/scrollHeight 而非 clientWidth：元素盒子被容器夹住时 clientWidth 偏小；
+ * 3. margin 清零：克隆节点会带上 mx-auto 算出的实际外边距，导致内容在画布上整体右移、右侧被裁掉。
+ */
+async function captureChart(): Promise<Uint8Array> {
   const node = seatChartRef.value;
-  if (!node) return;
+  if (!node) throw new Error("找不到座位图");
+  const dataUrl = await toPng(node, {
+    pixelRatio: 2,
+    backgroundColor: "#ffffff",
+    width: node.scrollWidth,
+    height: node.scrollHeight,
+    style: { margin: "0" },
+  });
+  return dataUrlToBytes(dataUrl);
+}
+
+/** 导出：单轮导一张 PNG（并把座位 JSON 存入历史记录）；多轮打包成 zip（第01次.png …） */
+async function exportImage() {
+  if (exporting.value) return;
   if (nameCount.value === 0) {
     showToast("没有学生，无法导出", "error");
     return;
   }
+  const original = roundIndex.value;
+  exporting.value = true;
   try {
-    // 只截这张卡片本身。两个坑：
-    // 1. scrollWidth 而非默认的 clientWidth——元素盒子被容器夹住时 clientWidth 偏小；
-    // 2. margin 清零——克隆节点会带上 mx-auto 算出的实际外边距（apply-style 只覆盖
-    //    options.style，不清 margin），导致内容在画布上整体右移、右侧被裁掉。
-    const dataUrl = await toPng(node, {
-      pixelRatio: 2,
-      backgroundColor: "#ffffff",
-      width: node.scrollWidth,
-      height: node.scrollHeight,
-      style: { margin: "0" },
-    });
     // 文件名带 5 位随机数，避免同一天多次导出时重名
     const rand5 = Math.floor(Math.random() * 90000) + 10000;
-    // 系统「另存为」对话框：让用户选本地路径
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    if (seatRounds.value.length <= 1) {
+      exportProgress.value = { done: 1, total: 1 }; // 单轮也占一个进度位，免得按钮显示「第 0 / 0 张」
+      const bytes = await captureChart();
+      const path = await save({
+        title: "保存座位图",
+        defaultPath: `座位图-${stamp}-${rand5}.png`,
+        filters: [{ name: "PNG 图片", extensions: ["png"] }],
+      });
+      if (!path) return; // 用户取消
+      await invoke("save_png", { path, data: Array.from(bytes) });
+      // 单轮导出沿袭原行为：同时把这张座位图存进历史记录（不存图片）
+      const rec: SeatRecord = {
+        id: `rec-${Date.now()}`,
+        exportedAt: Date.now(),
+        rows: rows.value,
+        colors: groupCfgs.value.map((c) => c.color),
+        seatsPerRow: seatCount.value,
+        singleSeatName: singleSeatName.value,
+        grid: seatGrid.value.map((g) => g.rows.map((row) => row.seats.map((s) => s.name))),
+      };
+      const ok = saveRecords([rec, ...loadRecords()]);
+      showToast(
+        `已保存到：${path}` + (ok ? "" : "（记录保存失败：本地存储容量不足）"),
+        ok ? "success" : "info",
+      );
+      return;
+    }
+
+    // 多轮：逐轮切到图上截图。切换会走 showRound（它会写 localStorage），
+    // 所以最后必须切回原来那一轮，不能把老师停的位置留在导出时的最后一轮。
+    const files: Record<string, Uint8Array> = {};
+    const total = seatRounds.value.length;
+    for (let i = 0; i < total; i++) {
+      exportProgress.value = { done: i + 1, total };
+      showRound(i);
+      await nextTick(); // 等 DOM 换成这一轮再截
+      files[`第${String(i + 1).padStart(2, "0")}次.png`] = await captureChart();
+    }
+
+    // level: 0（只打包不压缩）——PNG 本身就是压缩过的，再压一遍只费 CPU 不减体积
+    const zip = zipSync(files, { level: 0 });
     const path = await save({
-      title: "保存座位图",
-      defaultPath: `座位图-${new Date().toISOString().slice(0, 10)}-${rand5}.png`,
-      filters: [{ name: "PNG 图片", extensions: ["png"] }],
+      title: "保存座位图（zip）",
+      defaultPath: `座位图-${stamp}-${rand5}.zip`,
+      filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
     });
     if (!path) return; // 用户取消
-
-    await invoke("save_png", { path, data: Array.from(dataUrlToBytes(dataUrl)) });
-
-    const rec: SeatRecord = {
-      id: `rec-${Date.now()}`,
-      exportedAt: Date.now(),
-      rows: rows.value,
-      colors: groupCfgs.value.map((c) => c.color),
-      seatsPerRow: seatCount.value,
-      singleSeatName: singleSeatName.value,
-      grid: seatGrid.value.map((g) => g.rows.map((row) => row.seats.map((s) => s.name))),
-    };
-    const ok = saveRecords([rec, ...loadRecords()]);
-    showToast(
-      `已保存到：${path}` + (ok ? "" : "（记录保存失败：本地存储容量不足）"),
-      ok ? "success" : "info",
-    );
+    await invoke("save_png", { path, data: Array.from(zip) });
+    showToast(`已导出 ${total} 次座位图（zip）`, "success");
   } catch (e) {
     showToast(`导出失败：${e}`, "error");
+  } finally {
+    exportProgress.value = { done: 0, total: 0 };
+    exporting.value = false;
+    showRound(original); // 恢复老师原来停的那一轮
   }
 }
 
@@ -928,11 +975,13 @@ const draftCapacity = computed(
         组号反向
       </button>
       <button
-        class="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs text-white hover:opacity-90"
+        class="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="exporting"
         @click="exportImage"
       >
-        <Download :size="14" />
-        导出图片
+        <LoaderCircle v-if="exporting" :size="14" class="animate-spin" />
+        <Download v-else :size="14" />
+        {{ exporting ? `正在导出第 ${exportProgress.done} / ${exportProgress.total} 张…` : "导出图片" }}
       </button>
       <button
         class="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
