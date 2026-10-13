@@ -1221,6 +1221,18 @@ git commit -m "feat(ai): 一次生成 N 轮链式排座（含硬约束逐轮校�
 
 - [ ] **Step 2: 预览右栏加统计表与警告**
 
+**先补一处 Task 8 暴露的缺口**：第 1 轮生成完 `aiRounds.length > 0`，弹窗立刻切到预览态、输入态（带进度的那个按钮）被隐藏；而预览态的 busy 分支标题只有「模型思考中…」，没有进度——于是**从第 2 轮起界面上看不到「第 2 / N 次」**。N 越大越需要进度，偏偏从第 2 轮就没了。把预览态右栏那个 busy 分支的标题改成与输入态一致：
+
+```vue
+              <div class="flex items-center gap-1.5 text-xs font-medium text-title">
+                <LoaderCircle :size="12" class="animate-spin" />
+                <template v-if="aiProgress.total > 1">
+                  第 {{ aiProgress.done }} / {{ aiProgress.total }} 次 · 模型思考中…
+                </template>
+                <template v-else>模型思考中…</template>
+              </div>
+```
+
 在「为什么这么排」那块之后、`<details>` 思考过程之前插入：
 
 ```vue
