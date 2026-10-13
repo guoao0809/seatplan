@@ -855,11 +855,20 @@ function showRound(i: number) {
 }
 ```
 
-- [ ] **Step 4: 名单/配置变化时重置为单轮**
+- [ ] **Step 4: 名单/配置变化、以及回显记录时，都重置为单轮**
 
 `seedGrid()` 末尾（`persistGrid()` 之前）加两行——名单或排数变了，旧的多轮结果全部作废：
 
 ```ts
+  seatRounds.value = [currentGrid()];
+  roundIndex.value = 0;
+```
+
+**`applyRestore()` 末尾也要加同样两行**（放在 `seatGrid.value = p.grid.map(...)` 之后）：
+
+```ts
+  // 回显一条记录 = 回到单张状态：不重置的话，轮播会继续挂着上一批多轮结果，
+  // 界面显示的却是刚恢复的这张图，点箭头还会跳回一批陈旧的轮次
   seatRounds.value = [currentGrid()];
   roundIndex.value = 0;
 ```
