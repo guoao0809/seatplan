@@ -1247,13 +1247,19 @@ git commit -m "feat(ai): 一次生成 N 轮链式排座（含硬约束逐轮校�
 
 ```ts
 import FairnessTable from "../components/FairnessTable.vue";
-import { deskmateConflicts, fairnessReport, noDeskmatePairs, roundStatsOf } from "../lib/rotation";
+import { fairnessReport } from "../lib/rotation";
 
 /** 已生成的各轮 → 公平统计表 */
 const fairnessRows = computed(() =>
   fairnessReport(aiRounds.value.map((r) => r.grid), roster.value),
 );
 ```
+
+⚠️ **不要新增一条 `../lib/rotation` 的 import 语句**：Task 8 已经加过
+`import { deskmateConflicts, noDeskmatePairs, roundStatsOf } from "../lib/rotation";`，
+再写一条会让同名标识符重复声明、直接编译失败。**只在那一行已有的 import 上补 `fairnessReport`**
+（合成 `import { deskmateConflicts, fairnessReport, noDeskmatePairs, roundStatsOf } from "../lib/rotation";`），
+再另起一行加 `FairnessTable` 的组件 import。
 
 并在 `SeatView.vue` 顶部已有的 lucide 图标 import 列表里加上 `TriangleAlert`（警告框用图标而不是 `⚠` 文本字符，与全项目图标风格一致）。
 
