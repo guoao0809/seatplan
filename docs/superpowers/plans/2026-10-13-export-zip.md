@@ -264,3 +264,65 @@ git commit -m "feat(records): 一条记录装下整组轮换；回显后主页�
 5. **回显仍可轮播**：在记录页点这条记录的回显 → 主页出现 8 张、可左右切；切到第 5 张拖拽换座只影响那一张。
 6. **老记录不受影响**：以前存的单张记录回显照旧（只有一张、没有箭头）。
 7. **取消保存框**：导出中点取消 → 不报错、不写文件、按钮恢复；**且不应该多出记录**（取消时不存记录）。
+
+---
+
+### Task 15: 遗留 Minor 清理（4 处一行改动）
+
+**背景**：全分支终审被取消后，控制者自行裁定了各任务审查留下的 Minor，挑出 4 处值得修的（其余已记录为"接受"）。都是小改动，但其中第 1 条是**真 bug**。
+
+**Files:**
+- Modify: `src/views/SeatView.vue`、`src/views/RecordsView.vue`、`src/lib/ai.ts`
+
+- [ ] **Step 1: `showRound` 取配色取错了源（真 bug）**
+
+`showRound(i)` 里 `color: groupColor(gi)` 读的是 `seatGrid.value[gi]?.color`——而此刻 `seatGrid` 还是**上一张**网格（甚至为空）。于是从记录回显一组自带配色的座位时，首屏用的是旧调色板而不是记录里的配色（多轮回显走的正是这条路）。改成直接读组配置：
+
+```ts
+    seatGrid.value = grid.map((rowArr, gi) => ({
+      label: groupLabel(gi, grid.length, reverseGroups.value),
+      // 读组配置而不是 groupColor()：后者读的是 seatGrid 里上一张网格的颜色，
+      // 回显自带配色的记录时首屏会取到旧调色板
+      color: groupCfgs.value[gi]?.color ?? paletteColor(gi),
+      rows: rowArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
+    }));
+```
+
+（`groupColor()` 别的地方照旧用，不动它。）
+
+- [ ] **Step 2: 记录页 label 的间距**
+
+`RecordsView.vue` 里那个 `<span v-if="r.label">` 带 `mr-1.5`，加上 Vue 折叠出的那个空格，实际间距比预期宽 3~4px。**删掉 `mr-1.5`**（留一个空格的间距即可，别去动模板里的换行缩进）。
+
+- [ ] **Step 3: `ai.ts` 文件头措辞**
+
+「本文件不含任何静态 import，可独立自检」已经不准了（现在有一句 `import type`，虽然会被擦除）。改成：
+
+```ts
+// 本文件不含任何**运行时** import（只有一句类型导入，编译时会被擦除），可独立自检：
+// node --experimental-strip-types src/lib/ai.ts
+```
+
+- [ ] **Step 4: 消除 `p.rounds` 的别名**
+
+`applyRestore` 里 `seatRounds.value = p.rounds ? [...]` —— 直接赋值会让 seatRounds 与传入的 payload 共享同一个数组（拖拽换座会就地改到 payload）。今天没有复用路径，但复制一份是零成本的：
+
+```ts
+  seatRounds.value = p.rounds?.length ? [...p.rounds] : [p.grid];
+```
+
+- [ ] **Step 5: 验证**
+
+```bash
+cd /d/wok/worknotes/seatplan && node src/lib/seat.ts && node src/lib/ai.ts && node src/lib/rotation.ts
+cd /d/wok/worknotes/seatplan && npx vue-tsc --noEmit && pnpm build
+```
+预期：三个自检通过、`vue-tsc` 与 build 退出码 0。**不要启动应用**（老师实例可能开着）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /d/wok/worknotes/seatplan
+git add src/views/SeatView.vue src/views/RecordsView.vue src/lib/ai.ts
+git commit -m "fix: 回显配色取组配置、记录标签间距、文件头措辞、消除 payload 别名"
+```
