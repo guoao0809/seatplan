@@ -69,6 +69,102 @@ export function deskmateConflicts(grid: Grid, pairs: [string, string][]): [strin
   return hit;
 }
 
+/** 一个学生在若干轮里的位置分布 */
+export interface RoundStat {
+  name: string;
+  front: number;
+  mid: number;
+  back: number;
+  left: number;
+  right: number;
+}
+
+/** 公平统计表的一行：分布 + 各组次数 + 「一次都没轮到」的提示语 */
+export interface FairnessRow extends RoundStat {
+  groups: number[];
+  gaps: string[];
+}
+
+/**
+ * 位置带：1 排只有前排；2 排就是前后排（**没有中排**）；3 排及以上才三等分。
+ *
+ * 刻意不写成 `ri < total / 3 ? ... : ri >= (total * 2) / 3 ? ...`：那是浮点除法，
+ * 2 排时 `(2*2)/3 = 1.3333`，`ri=1 >= 1.3333` 为假 → 后排取不到、反倒多出一个中排。
+ * 这种"靠浮点边界碰巧对"的写法读代码的人验不出来，所以把每种排数摊开写。
+ */
+function bandOf(ri: number, total: number): "front" | "mid" | "back" {
+  if (total <= 1) return "front";
+  if (total === 2) return ri === 0 ? "front" : "back";
+  if (ri <= Math.floor((total - 1) / 3)) return "front";
+  if (ri >= Math.ceil((total * 2) / 3)) return "back";
+  return "mid";
+}
+
+/** 数出每个名字在各轮里坐过什么位置；顺带记录每个位置带在教室里是否存在 */
+function countPositions(grids: Grid[]): {
+  byName: Map<string, RoundStat & { groups: number[] }>;
+  /** 该位置带在全班一共出现过多少个座位：为 0 说明这个教室压根没有「中排」这种位置 */
+  bandSeats: Record<"front" | "mid" | "back", number>;
+} {
+  const byName = new Map<string, RoundStat & { groups: number[] }>();
+  const bandSeats = { front: 0, mid: 0, back: 0 };
+  for (const grid of grids) {
+    grid.forEach((rows, gi) => {
+      const total = rows.length;
+      rows.forEach((row, ri) => {
+        const band = bandOf(ri, total);
+        row.forEach((name, si) => {
+          bandSeats[band] += 1; // 空位也算「这个位置存在」
+          const key = name?.trim();
+          if (!key) return;
+          const cur =
+            byName.get(key) ??
+            { name: key, front: 0, mid: 0, back: 0, left: 0, right: 0, groups: [] };
+          cur[band] += 1;
+          if (si === 0) cur.left += 1;
+          else cur.right += 1;
+          cur.groups[gi] = (cur.groups[gi] ?? 0) + 1;
+          byName.set(key, cur);
+        });
+      });
+    });
+  }
+  return { byName, bandSeats };
+}
+
+/** 喂给模型的紧凑计分表（按名单顺序，只给有位置数据的） */
+export function roundStatsOf(grids: Grid[], students: RosterStudent[]): RoundStat[] {
+  const { byName } = countPositions(grids);
+  const out: RoundStat[] = [];
+  for (const s of students) {
+    const c = byName.get(s.name.trim());
+    if (!c) continue;
+    const { name, front, mid, back, left, right } = c;
+    out.push({ name, front, mid, back, left, right });
+  }
+  return out;
+}
+
+/** 公平统计表：判定口径刻意朴素——某一类排位置一次都没轮到才算 gap */
+export function fairnessReport(grids: Grid[], students: RosterStudent[]): FairnessRow[] {
+  const { byName, bandSeats } = countPositions(grids);
+  const out: FairnessRow[] = [];
+  for (const s of students) {
+    const c = byName.get(s.name.trim());
+    if (!c) continue;
+    const gaps: string[] = [];
+    // 只对「这个教室里真实存在的位置带」判轮空：2 排的教室没有中排，
+    // 否则会拿计数当代理去压，反而全班每个人都被标一句「没坐过中排」
+    if (grids.length > 1) {
+      if (bandSeats.front > 0 && c.front === 0) gaps.push("没坐过前排");
+      if (bandSeats.mid > 0 && c.mid === 0) gaps.push("没坐过中排");
+      if (bandSeats.back > 0 && c.back === 0) gaps.push("没坐过后排");
+    }
+    out.push({ ...c, groups: [...c.groups], gaps });
+  }
+  return out;
+}
+
 /** 自检：失败即抛错 */
 export function runRotationSelfCheck(): void {
   const must = (cond: boolean, msg: string) => {
@@ -145,6 +241,71 @@ export function runRotationSelfCheck(): void {
   );
   // 对外 API 不该要求调用方先归一顺序
   must(deskmateConflicts(desk, [["李四", "张三"]]).length === 1, "对子顺序反过来也要能查到");
+
+  // 公平统计：1 组 2 排 2 座。排 0 = 前排、排 1 = 后排（按排数三等分；2 排的教室没有中排）
+  // 嵌套层级注意：Grid = 组→排→座（三层），Grid[] = 轮→组→排→座（四层）
+  const one: Grid = [[["甲", "乙"], ["丙", "丁"]]];
+  const stat = roundStatsOf([one], [{ name: "甲" }, { name: "丙" }]);
+  must(stat.length === 2, `只统计名单里出现的名字，实际 ${stat.length}`);
+  const jia = stat.find((s) => s.name === "甲")!;
+  must(jia.front === 1 && jia.back === 0, `甲应前排 1 次后排 0 次，实际 ${JSON.stringify(jia)}`);
+  must(jia.left === 1 && jia.right === 0, `甲应左 1 右 0，实际 ${JSON.stringify(jia)}`);
+
+  // 两轮之间整排对调 → 每人前后排各坐一次；且 2 排教室里「中排」不存在，不该被标轮空
+  const rotated: Grid[] = [
+    [[["甲", "乙"], ["丙", "丁"]]],
+    [[["丙", "丁"], ["甲", "乙"]]],
+  ];
+  const rotatedRows = fairnessReport(rotated, [
+    { name: "甲" },
+    { name: "乙" },
+    { name: "丙" },
+    { name: "丁" },
+  ]);
+  must(
+    rotatedRows.every((r) => r.front === 1 && r.back === 1),
+    `每人应前后排各一次，实际 ${JSON.stringify(rotatedRows.map((r) => [r.name, r.front, r.back]))}`,
+  );
+  must(
+    rotatedRows.every((r) => r.gaps.length === 0),
+    `轮换到位不该有 gap，实际 ${JSON.stringify(rotatedRows.filter((r) => r.gaps.length))}`,
+  );
+
+  // 有人永远坐在同一排 → 标「没坐过后排」，但不该标「没坐过中排」（这教室没有中排）
+  const skew: Grid[] = [
+    [[["甲", "乙"], ["丙", "丁"]]],
+    [[["甲", "乙"], ["丁", "丙"]]],
+  ];
+  const skewRows = fairnessReport(skew, [{ name: "甲" }, { name: "乙" }]);
+  const jiaSkew = skewRows.find((r) => r.name === "甲")!;
+  must(
+    jiaSkew.front === 2 && jiaSkew.back === 0,
+    `甲应前排 2 后排 0，实际 ${JSON.stringify(jiaSkew)}`,
+  );
+  must(
+    jiaSkew.gaps.some((g) => g.includes("后排")),
+    `甲从没坐过后排，应被标出，实际 ${JSON.stringify(jiaSkew.gaps)}`,
+  );
+  must(
+    !jiaSkew.gaps.some((g) => g.includes("中排")),
+    `2 排教室没有中排，不该标「没坐过中排」，实际 ${JSON.stringify(jiaSkew.gaps)}`,
+  );
+
+  // 位置带划分直接钉死：每种排数各人是前/中/后，避免再出现「靠浮点边界碰巧对」的写法
+  const bands = (total: number) => {
+    const grid: Grid = [Array.from({ length: total }, (_, ri) => [`r${ri}`])];
+    const students = Array.from({ length: total }, (_, ri) => ({ name: `r${ri}` }));
+    return fairnessReport([grid], students)
+      .map((r) => `${r.name}=${r.front}${r.mid}${r.back}`)
+      .join(",");
+  };
+  must(bands(1) === "r0=100", `1 排应全算前排，实际 ${bands(1)}`);
+  must(bands(2) === "r0=100,r1=001", `2 排应前/后（无中排），实际 ${bands(2)}`);
+  must(bands(3) === "r0=100,r1=010,r2=001", `3 排应三等分，实际 ${bands(3)}`);
+  must(
+    bands(8) === "r0=100,r1=100,r2=100,r3=010,r4=010,r5=010,r6=001,r7=001",
+    `8 排应 3/3/2，实际 ${bands(8)}`,
+  );
 }
 
 // 自检也可用 node 直接跑
