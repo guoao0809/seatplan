@@ -174,3 +174,93 @@ git commit -m "feat(seat): 多轮座位导出为 zip（单轮仍导出单张 PNG
 3. **导出完停在原来那一轮**：导出前切到第 3 张，导出完成后应仍停在第 3 张（不是第 8 张）。
 4. **取消保存框**：导出过程中/保存框点取消 → 不报错、不写文件、按钮恢复正常。
 5. **zip 里的图**：随便解出一张，应是一张完整的座位图（讲台、单座、各组座位、配色都在），没有右侧被裁或整体偏移。
+
+---
+
+### Task 14: 一条记录装下整组轮换（导出与回显都跟着改）
+
+**背景**：老师要求「导出时存 **1 条**记录，回显到主页后仍能轮播切换」。这要求记录能装下整组 N 轮——而 `SeatRecord` 现在只有一张图（`grid`），主页的多轮另存于 `localStorage["seatplan:rounds"]`。老记录（只有 `grid`）必须继续可用。
+
+**Files:**
+- Modify: `src/lib/records.ts`（`SeatRecord` 加 `rounds?`；`RestorePayload` 的 Pick 里带上它）
+- Modify: `src/views/SeatView.vue`（回显、导出存记录、弹窗里的「全部存入记录」）
+
+**Interfaces:**
+- Produces: `SeatRecord.rounds?: (string | null)[][][]`（老记录没有此字段 → 视为单轮）
+
+- [ ] **Step 1: 记录加字段**
+
+`src/lib/records.ts` 的 `SeatRecord` 里、`grid` 之后加：
+
+```ts
+  /** 整组轮换；一次排座生成 N 轮时带此字段。老记录没有它 → 视为单轮 */
+  rounds?: (string | null)[][][];
+```
+
+`RestorePayload` 的 Pick 里加上 `"rounds"`。
+
+- [ ] **Step 2: 回显带回整组**
+
+`src/views/SeatView.vue` 的 `applyRestore(p)` 改成：先把名单/配置等前置状态写好（保持既有顺序），然后用 `showRound(0)` 从 `seatRounds[0]` 重建显示，而不是自己拼 `seatGrid`：
+
+```ts
+  // 老记录只有单张 grid；带 rounds 的记录回显整组，回显后仍能轮播
+  seatRounds.value = p.rounds?.length ? p.rounds : [p.grid];
+  roundIndex.value = 0;
+  showRound(0); // 它负责重建 seatGrid 并按 seatRounds[0] 落盘
+```
+
+（`showRound` 必须在 `groupCfgs` / `reverseGroups` 等都写好之后调用——它内部用到了它们。）
+
+- [ ] **Step 3: 两个存记录的地方都改成 1 条**
+
+导出路径（多轮分支）与 AI 弹窗的 `saveRoundsToRecords()` 都改成**存一条**，把那组轮次放进 `rounds`：
+
+```ts
+/** 一次排座的记录：单轮时与老记录同形（不带 rounds），多轮时把整组带上 */
+function roundsRecord(grids: (string | null)[][][]): SeatRecord {
+  const n = grids.length;
+  return {
+    id: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    exportedAt: Date.now(),
+    // 多轮才带 label 与 rounds：单轮产出的记录与老记录形状一致，不引入新字段
+    ...(n > 1 ? { label: `${n} 次轮换`, rounds: grids } : {}),
+    rows: rows.value,
+    colors: groupCfgs.value.map((c) => c.color),
+    seatsPerRow: seatCount.value,
+    singleSeatName: singleSeatName.value,
+    grid: grids[0]!, // 老字段仍是第一张，任何只读 grid 的既有代码照旧可用
+  };
+}
+```
+
+- 导出：多轮分支在**用户确认保存路径之后**（即 `if (!path) return` 之后）存一条：`saveRecords([roundsRecord(gridsOfRounds), ...loadRecords()])`（**一条**，不是 N 条）。**取消保存框就不该留记录**——存记录必须排在路径确认之后，与单轮路径今天的顺序一致。失败时照旧 toast 提示（`saveRecords` 返回 false）。
+  单轮分支**保持现状不动**（仍然是一条不带 `rounds` 的记录 + 原 toast）。
+- `saveRoundsToRecords()`：改成 `saveRecords([roundsRecord(aiRounds.map(r => r.grid)), ...])`（一条）。toast 文案相应改成「已存入记录（N 次轮换）」。
+
+- [ ] **Step 4: 验证**
+
+```bash
+cd /d/wok/worknotes/seatplan && npx vue-tsc --noEmit && pnpm build
+```
+预期：两条都退出码 0。GUI 由老师自验。
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /d/wok/worknotes/seatplan
+git add src/lib/records.ts src/views/SeatView.vue
+git commit -m "feat(records): 一条记录装下整组轮换；回显后主页仍可轮播"
+```
+
+---
+
+## 给老师的验收（Task 13 + Task 14 一起看）
+
+1. **单轮导出与以前逐字一致**：只弹 PNG 保存框、文件名 `座位图-日期-随机数.png`、导出后提示「已保存到：…」、记录页多出 1 条（不带「第 N 次」徽标）。
+2. **多轮导出**：生成 8 次并应用到主页 → 点「导出图片」→ 按钮显示「正在导出第 i / 8 张…」→ 存出的 zip 里有 `第01次.png` … `第08次.png` 共 8 个文件。
+3. **导出后停回原轮**：导出前切到第 3 张，导出完成后仍停在第 3 张。
+4. **记录只多 1 条**：多轮导出后记录页**只新增 1 条**，带「8 次轮换」徽标（不是 8 条）。
+5. **回显仍可轮播**：在记录页点这条记录的回显 → 主页出现 8 张、可左右切；切到第 5 张拖拽换座只影响那一张。
+6. **老记录不受影响**：以前存的单张记录回显照旧（只有一张、没有箭头）。
+7. **取消保存框**：导出中点取消 → 不报错、不写文件、按钮恢复；**且不应该多出记录**（取消时不存记录）。
