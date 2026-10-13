@@ -1248,6 +1248,17 @@ const fairnessRows = computed(() =>
 
 并在 `SeatView.vue` 顶部已有的 lucide 图标 import 列表里加上 `TriangleAlert`（警告框用图标而不是 `⚠` 文本字符，与全项目图标风格一致）。
 
+**同时改一处 `FairnessTable.vue`**（Task 5 审查的遗留项，本任务顺手带上）：它现在用 `:key="r.name"`，而名单里完全可能出现同名学生（一个班两个「张伟」很正常），届时 Vue 会报重复 key 并可能渲染错行。改成复合键：
+
+```vue
+        <tr
+          v-for="(r, i) in rows"
+          :key="`${i}-${r.name}`"
+          class="border-b border-border last:border-0"
+          :class="r.gaps.length ? 'bg-red-50' : ''"
+        >
+```
+
 - [ ] **Step 3: 追问范围**
 
 状态与两个入口：
