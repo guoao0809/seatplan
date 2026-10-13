@@ -7,8 +7,6 @@
 // 本文件不含任何静态 import，可独立自检：node --experimental-strip-types src/lib/ai.ts
 // （下面这条 import type 只用于类型、会被完全擦除，不影响可独立自检）
 
-import type { RoundStat } from "./rotation";
-
 /** config.json 的内容（OpenAI 兼容） */
 export interface AiConfig {
   baseUrl: string;
@@ -59,8 +57,8 @@ export interface ArrangeInput {
   instruction: string;
   /** 学生档案（特点 / 注意事项），排座时需照顾到的个体需求 */
   students?: StudentNote[];
-  /** 前几轮的位置计分表（程序算，喂给模型判断公平），没有多轮时可为空 */
-  roundStats?: RoundStat[];
+  /** 要求一次生成几次换座；不传或为 1 表示单次（追问路径）。payload 里只有 > 1 时才出现 */
+  rounds?: number;
 }
 
 /** 一个学生的特点与注意事项；name 与网格里的姓名对应 */
@@ -131,6 +129,8 @@ const SYSTEM_PROMPT = [
   "",
   "返回格式（严格遵守，就这一个 JSON 对象）：",
   '{"reason":"用一两句中文说明你这样调整的理由","ops":[操作1,操作2,...]}',
+  "用户要求**一次生成 N 次换座**时，改成：",
+  '{"reason":"…","rounds":[[操作…],[操作…],…]}   // 正好 N 组；第 i 组作用在第 i-1 组的结果上，current 是第 1 组的基准',
   "",
   "可用操作（ops 数组内按顺序执行）：",
   '1. {"op":"swapSeats","a":[组,排,座],"b":[组,排,座]}   交换两个座位上的学生',
@@ -156,14 +156,12 @@ const SYSTEM_PROMPT = [
   "8. students 是学生档案（可为空），给出部分学生的特点（trait）与注意事项（note）。排座要照顾到它们：",
   "   近视 / 个子矮靠前，好动 / 话多分开，需要单独坐的排到边缘或单座，写明「不能同桌」的绝不排一起。",
   "   照顾不到时在 reason 里说明，不要假装做到了。",
-  "9. roundStats 是前几次换座的位置计分表（可为空）：每人已坐前/中/后排、左/右各几次。",
-  "   用户要求「公平轮换」时，优先把 front/mid/back 明显偏低（尤其为 0）的学生换到缺的位置去，",
-  "   而不是平均主义地打乱所有人。",
-  "10. 约束涉及同桌时（「A 不能和 B 同桌」「有同样特点的不能同桌」等），必须拿 deskPairs **逐对过一遍**：",
+  "9. 约束涉及同桌时（「A 不能和 B 同桌」「有同样特点的不能同桌」等），必须拿 deskPairs **逐对过一遍**：",
   "   凡违反的对，都要用 swapSeats 把其中一人换到一个不会制造新违规的座位去。",
   "   注意 deskPairs 的每一对里，两个座位**本来就是同桌**——把它们两个对调等于什么都没做，这是最常见的错误。",
   "   下完操作后自己再核对一遍：deskPairs 里不该再有任何一对违反用户约束。",
-  "11. 思考过程一律用中文写（给用户看的），不要用英文。",
+  "10. 思考过程一律用中文写（给用户看的），不要用英文。",
+  "11. 要求生成 N 次时，rounds 必须正好 N 组，且逐组累积——不要每组都从 current 重新算，那样等于原地不动。",
 ].join("\n");
 
 /** 构造首轮的 system + user 消息 */
@@ -185,7 +183,7 @@ export function buildMessages(input: ArrangeInput): { system: string; user: stri
     roster: input.singleSeatName ? [...inGrid, input.singleSeatName] : inGrid,
     ...(students.length > 0 ? { students } : {}),
     deskPairs: deskPairsOf(input.grid, input.students ?? []),
-    ...(input.roundStats?.length ? { roundStats: input.roundStats } : {}),
+    ...(input.rounds && input.rounds > 1 ? { rounds: input.rounds } : {}),
     current: input.grid,
     history: input.history,
   };
@@ -363,6 +361,69 @@ export function parseArrangement(text: string, grid: Grid, labels: string[]): Pa
 
   const ops = rec.ops as SeatOp[];
   return { ok: true, grid: applyOps(grid, ops), reason, ops, summary: describeOps(ops, labels) };
+}
+
+/** 一次调用返回的多轮结果：rounds[i] 是第 i+1 次换座（作用在第 i 次的结果上） */
+export interface ParsedRounds {
+  grid: Grid;
+  ops: SeatOp[];
+  summary: string;
+}
+export type ParseRoundsOutcome =
+  | { ok: true; rounds: ParsedRounds[]; reason: string }
+  | { ok: false; error: string };
+
+/**
+ * 解析一次返回的 N 组操作。
+ *
+ * 兼容两种形状：`{reason, rounds:[…]}`（多轮）与 `{reason, ops:[…]}`（单轮，追问路径仍在用）。
+ * rounds 里每一项可以是裸的操作数组，也可以是 `{ops:[…]}`。
+ * 逐组校验下标、逐组套用在**前一组的结果**上——不是各自从 base 算，这是「轮换」语义的关键。
+ */
+export function parseRoundSets(
+  text: string,
+  base: Grid,
+  labels: string[],
+  want: number,
+): ParseRoundsOutcome {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripToJson(text));
+  } catch (e) {
+    return { ok: false, error: `返回不是合法 JSON：${e}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: '返回应为 {"reason":"…","rounds":[…] } 对象' };
+  }
+  const rec = parsed as Record<string, unknown>;
+  const reason = typeof rec.reason === "string" ? rec.reason.trim() : "";
+
+  const rawSets: unknown[] | null = Array.isArray(rec.rounds)
+    ? rec.rounds
+    : Array.isArray(rec.ops)
+      ? [{ ops: rec.ops }]
+      : null;
+  if (!rawSets) return { ok: false, error: "返回里既没有 rounds 也没有 ops" };
+  if (rawSets.length !== want) {
+    return { ok: false, error: `要求生成 ${want} 次换座，模型给了 ${rawSets.length} 次` };
+  }
+
+  const out: ParsedRounds[] = [];
+  let grid = base;
+  for (let i = 0; i < rawSets.length; i++) {
+    const item = rawSets[i];
+    const opsRaw = Array.isArray(item)
+      ? item
+      : item && typeof item === "object"
+        ? (item as Record<string, unknown>).ops
+        : undefined;
+    const bad = validateOps(opsRaw, grid);
+    if (bad) return { ok: false, error: `第 ${i + 1} 次：${bad}` };
+    const ops = opsRaw as SeatOp[];
+    grid = applyOps(grid, ops);
+    out.push({ grid, ops, summary: describeOps(ops, labels) });
+  }
+  return { ok: true, rounds: out, reason };
 }
 
 /** 追问时追加的消息：本轮 payload 必须按「当前网格」重建，模型才知道现在的状态 */
@@ -614,24 +675,6 @@ export function runAiSelfCheck(): void {
     ) as { students?: unknown; deskPairs: DeskPair[] };
     must(!("students" in noNotes), "没有档案时不应出现 students 字段");
 
-    // 公平计分表：给了就带上，没给不出现该字段
-    const withStats = JSON.parse(
-      buildMessages({
-        grid: base,
-        labels,
-        singleSeatName: "",
-        history: [],
-        instruction: "排座",
-        roundStats: [{ name: "甲", front: 2, mid: 1, back: 0, left: 1, right: 2 }],
-      }).user,
-    ) as { roundStats?: unknown };
-    must(
-      JSON.stringify(withStats.roundStats) ===
-        JSON.stringify([{ name: "甲", front: 2, mid: 1, back: 0, left: 1, right: 2 }]),
-      `roundStats 应原样进 payload，实际 ${JSON.stringify(withStats.roundStats)}`,
-    );
-    must(!("roundStats" in noNotes), "没给计分表时不应出现 roundStats 字段");
-
     // deskPairs：同桌对由程序算好——每排一组相邻两座，带上两人的档案，空位是 null，双空排不出现
     const pairs = noNotes.deskPairs;
     must(pairs.length === 5, `base 有 2+3 排共 5 对同桌，实际 ${pairs.length}`);
@@ -694,6 +737,99 @@ export function runAiSelfCheck(): void {
     must(next[2]!.role === "assistant" && next[2]!.content === "reply1", "第 3 条应为上一轮原文");
     must(next[3]!.role === "user" && next[3]!.content === "u2", "第 4 条应为本轮 payload");
     must(msgs.length === 2, "appendFollowUp 不应改动原数组");
+  }
+
+  // ---- parseRoundSets：一次返回 N 组操作 ----
+  {
+    const roundsBase: Grid = [[["a1", "a2"]]];
+    const roundsLabels = ["第一组"];
+    // 两组 rotateLR：每组都把两个座位对调，两组叠加应回到原样——证明是逐组套用，不是各自从 base 算
+    const two = parseRoundSets(
+      JSON.stringify({ reason: "轮流左右", rounds: [[{ op: "rotateLR" }], [{ op: "rotateLR" }]] }),
+      roundsBase,
+      roundsLabels,
+      2,
+    );
+    must(two.ok, `两组 rotateLR 应解析成功，实际 ${two.ok ? "" : two.error}`);
+    if (two.ok) {
+      must(
+        JSON.stringify(two.rounds[0]!.grid) === JSON.stringify([[["a2", "a1"]]]),
+        `第 1 组应左右对调，实际 ${JSON.stringify(two.rounds[0]!.grid)}`,
+      );
+      must(
+        JSON.stringify(two.rounds[1]!.grid) === JSON.stringify(roundsBase),
+        `第 2 组应再对调一次回到原样（逐组套用），实际 ${JSON.stringify(two.rounds[1]!.grid)}`,
+      );
+      must(two.rounds[1]!.summary.includes("左右对调"), "每组应各自带一份操作摘要");
+    }
+
+    // 单轮形状 {reason, ops} 仍要接受（追问「当前这次」还在用）
+    const one = parseRoundSets(
+      JSON.stringify({ reason: "r", ops: [{ op: "rotateLR" }] }),
+      roundsBase,
+      roundsLabels,
+      1,
+    );
+    must(one.ok && one.rounds.length === 1, "单轮形状 {reason, ops} 应被接受");
+
+    // 组数不符 → 报错
+    const short = parseRoundSets(
+      JSON.stringify({ reason: "r", rounds: [[{ op: "rotateLR" }]] }),
+      roundsBase,
+      roundsLabels,
+      2,
+    );
+    must(!short.ok && short.error.includes("2"), `组数不足应报错，实际 ${short.ok ? "ok" : short.error}`);
+
+    // 第 2 组下标越界 → 报错要点名「第 2 次」
+    const broken = parseRoundSets(
+      JSON.stringify({
+        reason: "r",
+        rounds: [[{ op: "rotateLR" }], [{ op: "swapSeats", a: [0, 0, 0], b: [9, 9, 9] }]],
+      }),
+      roundsBase,
+      roundsLabels,
+      2,
+    );
+    must(
+      !broken.ok && broken.error.includes("第 2 次"),
+      `第 2 组下标越界应点名第 2 次，实际 ${broken.ok ? "ok" : broken.error}`,
+    );
+
+    // rounds 里每一项写成 {ops:[…]} 也要接受
+    const wrapped = parseRoundSets(
+      JSON.stringify({ reason: "r", rounds: [{ ops: [{ op: "rotateLR" }] }] }),
+      roundsBase,
+      roundsLabels,
+      1,
+    );
+    must(wrapped.ok, `{ops:[…]} 形状应被接受，实际 ${wrapped.ok ? "" : wrapped.error}`);
+
+    // 既没有 rounds 也没有 ops
+    const empty = parseRoundSets(JSON.stringify({ reason: "r" }), roundsBase, roundsLabels, 1);
+    must(!empty.ok, "既无 rounds 也无 ops 应报错");
+  }
+
+  // ---- payload 不应再有 roundStats，但要有 rounds（要求生成几次）----
+  {
+    const p = JSON.parse(
+      buildMessages({ grid: base, labels, singleSeatName: "", history: [], instruction: "排座" }).user,
+    ) as { roundStats?: unknown; rounds?: unknown };
+    must(!("roundStats" in p), "payload 不应再带 roundStats");
+    must(!SYSTEM_PROMPT.includes("roundStats"), "提示词不应再提 roundStats");
+    must(!("rounds" in p), "不传 rounds 时 payload 不该出现该字段（单次场景）");
+
+    const many = JSON.parse(
+      buildMessages({
+        grid: base,
+        labels,
+        singleSeatName: "",
+        history: [],
+        instruction: "排座",
+        rounds: 8,
+      }).user,
+    ) as { rounds?: unknown };
+    must(many.rounds === 8, `rounds=8 应原样进 payload，实际 ${JSON.stringify(many.rounds)}`);
   }
 }
 

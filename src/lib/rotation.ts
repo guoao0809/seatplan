@@ -139,20 +139,6 @@ function emptyCounts(name: string): RoundStat & { groups: number[] } {
   return { name, front: 0, mid: 0, back: 0, left: 0, right: 0, groups: [] };
 }
 
-/** 喂给模型的紧凑计分表（按名单顺序；一轮都没排上的学生也留一行全 0） */
-export function roundStatsOf(grids: Grid[], students: RosterStudent[]): RoundStat[] {
-  const { byName } = countPositions(grids);
-  const out: RoundStat[] = [];
-  for (const s of students) {
-    const name = s.name.trim();
-    if (!name) continue;
-    const c = byName.get(name) ?? emptyCounts(name);
-    const { front, mid, back, left, right } = c;
-    out.push({ name, front, mid, back, left, right });
-  }
-  return out;
-}
-
 /** 公平统计表：判定口径刻意朴素——某一类排位置一次都没轮到才算 gap */
 export function fairnessReport(grids: Grid[], students: RosterStudent[]): FairnessRow[] {
   const { byName, bandSeats } = countPositions(grids);
@@ -253,15 +239,6 @@ export function runRotationSelfCheck(): void {
   // 对外 API 不该要求调用方先归一顺序
   must(deskmateConflicts(desk, [["李四", "张三"]]).length === 1, "对子顺序反过来也要能查到");
 
-  // 公平统计：1 组 2 排 2 座。排 0 = 前排、排 1 = 后排（按排数三等分；2 排的教室没有中排）
-  // 嵌套层级注意：Grid = 组→排→座（三层），Grid[] = 轮→组→排→座（四层）
-  const one: Grid = [[["甲", "乙"], ["丙", "丁"]]];
-  const stat = roundStatsOf([one], [{ name: "甲" }, { name: "丙" }]);
-  must(stat.length === 2, `只统计名单里出现的名字，实际 ${stat.length}`);
-  const jia = stat.find((s) => s.name === "甲")!;
-  must(jia.front === 1 && jia.back === 0, `甲应前排 1 次后排 0 次，实际 ${JSON.stringify(jia)}`);
-  must(jia.left === 1 && jia.right === 0, `甲应左 1 右 0，实际 ${JSON.stringify(jia)}`);
-
   // 两轮之间整排对调 → 每人前后排各坐一次；且 2 排教室里「中排」不存在，不该被标轮空
   const rotated: Grid[] = [
     [[["甲", "乙"], ["丙", "丁"]]],
@@ -330,10 +307,6 @@ export function runRotationSelfCheck(): void {
   must(
     ghost.gaps.length === 3,
     `落空的学生三类排位置都该标出来，实际 ${JSON.stringify(ghost.gaps)}`,
-  );
-  must(
-    roundStatsOf(ghostGrids, [{ name: "落空" }]).length === 1,
-    "计分表也要给落空的学生留一行，模型才知道谁一次都没排上",
   );
 
   // groups 不能有 undefined 空洞（渲染出来就是 "undefined"）
