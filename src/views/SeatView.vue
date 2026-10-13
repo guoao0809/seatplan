@@ -13,6 +13,7 @@ import {
   LoaderCircle,
   Plus,
   Trash2,
+  TriangleAlert,
 } from "lucide-vue-next";
 import { toPng } from "html-to-image";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -36,7 +37,12 @@ import {
   type GroupConfig,
   type RosterRow,
 } from "../lib/seat";
-import { deskmateConflicts, noDeskmatePairs, roundStatsOf } from "../lib/rotation";
+import {
+  deskmateConflicts,
+  fairnessReport,
+  noDeskmatePairs,
+  roundStatsOf,
+} from "../lib/rotation";
 import { loadRecords, saveRecords, type SeatRecord, type RestorePayload } from "../lib/records";
 import {
   loadAiConfig,
@@ -52,6 +58,7 @@ import {
 } from "../lib/ai";
 import { showToast } from "../components/toast";
 import RoundSwitcher from "../components/RoundSwitcher.vue";
+import FairnessTable from "../components/FairnessTable.vue";
 
 const props = defineProps<{ restore: RestorePayload | null }>();
 
@@ -116,6 +123,8 @@ const aiProgress = ref({ done: 0, total: 0 });
 const aiRound = computed<AiRound | null>(() => aiRounds.value[aiRoundIndex.value] ?? null);
 /** 追问输入框 */
 const aiFollowUp = ref("");
+/** 追问范围：只重排当前这一轮 / 按新要求把 N 轮全部重跑 */
+const aiScope = ref<"round" | "all">("round");
 /** 本轮对话（首轮 system+user，追问依次追加 assistant+user） */
 const aiMessages = ref<ChatMessage[]>([]);
 /** 上一轮模型原始返回，追问时作为 assistant 消息回灌 */
@@ -132,6 +141,11 @@ watch(aiThinking, async () => {
 
 const aiPreviewNames = computed(() =>
   aiRound.value ? flattenNames(aiRound.value.grid).length : 0,
+);
+
+/** 已生成的各轮 → 公平统计表 */
+const fairnessRows = computed(() =>
+  fairnessReport(aiRounds.value.map((r) => r.grid), roster.value),
 );
 
 /** 当前网格的纯数据快照（组 → 排 → 座 → 姓名或 null） */
@@ -166,6 +180,8 @@ const seatGrid = ref<Group[]>([]);
 /** 一次生成的多轮座位图；N=1 时长度就是 1，行为与单张完全一致 */
 const seatRounds = ref<Grid[]>([[]]);
 const roundIndex = ref(0);
+/** 主页多轮座位图 → 轮换统计表 */
+const seatFairnessRows = computed(() => fairnessReport(seatRounds.value, roster.value));
 interface DragPos {
   g: number;
   r: number;
@@ -347,7 +363,8 @@ function closeAi() {
   resetAiRun();
 }
 
-/** 清空一次排座的全部中间状态（预览、理由、对话、追问框） */
+/** 清空一次排座的全部中间状态（预览、理由、对话、追问框）。
+ *  注意：它同时会作废在途的链（aiReqId++）——不要在一次新排座的 id 取号之后再调用它。 */
 function resetAiRun() {
   aiReqId++; // 作废在途的链：否则它跑完会继续往刚清空的 aiRounds 里写
   aiBusy.value = false; // 链已作废，界面不能继续卡在「排座中」
@@ -360,42 +377,6 @@ function resetAiRun() {
   aiFollowUp.value = "";
   aiMessages.value = [];
   aiLastRaw.value = "";
-}
-
-/** 发一次请求并执行模型给出的操作。msgs 为本轮完整对话，baseGrid 为本轮操作的基准网格。 */
-async function callAi(msgs: ChatMessage[], baseGrid: Grid, labels: string[]): Promise<void> {
-  const cfg = aiConfig.value;
-  if (!cfg) return;
-  const id = ++aiReqId;
-  aiBusy.value = true;
-  aiError.value = "";
-  aiThinking.value = "";
-  try {
-    const text = await arrangeSeats(cfg, msgs, (e) => {
-      if (id !== aiReqId) return; // 已作废的请求：别再把它的思考往回写
-      if (e.kind === "reasoning") aiThinking.value += e.text;
-    });
-    if (id !== aiReqId) return; // 请求已被 closeAi 作废：丢弃迟到结果，不动 aiBusy
-    const res = parseArrangement(text, baseGrid, labels);
-    if (!res.ok) {
-      aiError.value = `校验未通过：${res.error}\n\n模型原始返回：\n${text}`;
-      return;
-    }
-    aiMessages.value = msgs;
-    aiLastRaw.value = text;
-    aiRounds.value[aiRoundIndex.value] = {
-      grid: res.grid,
-      reason: res.reason,
-      summary: res.summary,
-      warnings: [],
-    };
-    aiPreviewEdited.value = false;
-  } catch (e) {
-    if (id !== aiReqId) return; // 已作废的迟到错误不回写
-    aiError.value = String(e);
-  } finally {
-    if (id === aiReqId) aiBusy.value = false; // 只清自己的请求，别清后来者的
-  }
 }
 
 /** 组名按屏幕显示顺序取——开了「组号反向」时 seatGrid[0] 的标签不是「第一组」 */
@@ -429,7 +410,7 @@ async function runAi() {
     return;
   }
 
-  const total = Math.min(20, Math.max(1, Math.round(roundsToGenerate.value) || 1));
+  const total = roundsClamped.value;
   const cfg = aiConfig.value;
   const id = ++aiReqId;
   const labels = currentLabels();
@@ -518,14 +499,15 @@ async function runAi() {
   }
 }
 
-/** 追问：以「当前预览」为基准重建 payload（模型才知道现在的状态），再接进对话 */
+/** 追问（当前这次）：以当前轮为基准重建 payload（模型才知道现在的状态），只重排这一轮 */
 async function runFollowUp() {
   if (aiBusy.value) return;
   const text = aiFollowUp.value.trim();
   const baseGrid = aiRound.value?.grid;
-  if (!text || !aiLastRaw.value || !baseGrid) return;
+  const cfg = aiConfig.value;
+  if (!text || !baseGrid || !cfg) return;
   const labels = currentLabels();
-  const { user } = buildMessages({
+  const { system, user } = buildMessages({
     grid: baseGrid,
     labels,
     singleSeatName: singleSeatName.value,
@@ -533,23 +515,95 @@ async function runFollowUp() {
     instruction: text,
     students: roster.value,
   });
-  await callAi(appendFollowUp(aiMessages.value, aiLastRaw.value, user), baseGrid, labels);
-  if (!aiError.value) aiFollowUp.value = "";
+  // 链式生成（runAi）不再经过旧 callAi，aiLastRaw/aiMessages 可能为空；
+  // 此时从零起一段对话即可——payload 里已带当前轮座位图，模型不丢上下文
+  const msgs: ChatMessage[] = aiLastRaw.value
+    ? appendFollowUp(aiMessages.value, aiLastRaw.value, user)
+    : [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ];
+  const id = ++aiReqId;
+  aiBusy.value = true;
+  aiError.value = "";
+  aiThinking.value = "";
+  try {
+    const raw = await arrangeSeats(cfg, msgs, (e) => {
+      if (id !== aiReqId) return; // 已作废的请求：别再把它的思考往回写
+      if (e.kind === "reasoning") aiThinking.value += e.text;
+    });
+    if (id !== aiReqId) return; // 请求已作废：丢弃迟到结果
+    const res = parseArrangement(raw, baseGrid, labels);
+    if (!res.ok) {
+      aiError.value = `校验未通过：${res.error}\n\n模型原始返回：\n${raw}`;
+      return;
+    }
+    aiMessages.value = msgs;
+    aiLastRaw.value = raw;
+    // 只替换当前这一轮，并重算该轮的硬约束警告
+    aiRounds.value[aiRoundIndex.value] = {
+      grid: res.grid,
+      reason: res.reason,
+      summary: res.summary,
+      warnings: deskmateConflicts(res.grid, noDeskmatePairs(roster.value)).map(
+        ([a, b]) => `${a} 与 ${b} 仍同桌`,
+      ),
+    };
+    aiPreviewEdited.value = false;
+    aiFollowUp.value = "";
+  } catch (e) {
+    if (id !== aiReqId) return; // 已作废的迟到错误不回写
+    aiError.value = String(e);
+  } finally {
+    if (id === aiReqId) aiBusy.value = false; // 只清自己的请求
+  }
 }
 
-/** 把预览结果写入座位图并持久化 */
-function applyAi() {
-  const g = aiRound.value?.grid;
-  if (!g) return;
-  seatGrid.value = g.map((rowsArr, gi) => ({
-    label: groupLabel(gi, g.length, reverseGroups.value),
-    color: groupColor(gi),
-    rows: rowsArr.map((r) => ({ seats: r.map((n) => ({ name: n })) })),
-  }));
-  persistGrid();
+/** 追问范围分派：只重排当前这一轮 / 整体重跑全部 N 轮 */
+async function onFollowUp() {
+  if (aiScope.value === "all") await runFollowUpAll();
+  else await runFollowUp();
+}
+
+/** 整体重排：把当前规则换成追问内容，N 轮全部重新生成 */
+async function runFollowUpAll() {
+  const text = aiFollowUp.value.trim();
+  if (!text || aiBusy.value) return;
+  aiPrompt.value = `${aiPrompt.value.trim()}\n${text}`;
+  aiFollowUp.value = "";
+  await runAi(); // runAi 会按 roundsToGenerate 重新链式生成
+}
+
+/** 应用整组结果到主页 */
+function applyRounds() {
+  if (aiRounds.value.length === 0) return;
+  seatRounds.value = aiRounds.value.map((r) => r.grid);
+  showRound(0);
   showAi.value = false;
   resetAiRun();
-  showToast("已应用 AI 排座结果", "success");
+  showToast(`已应用 ${seatRounds.value.length} 次座位`, "success");
+}
+
+/** 把 N 轮存成 N 条记录（带「第 N 次」标签） */
+function saveRoundsToRecords() {
+  if (aiRounds.value.length === 0) return;
+  const list = loadRecords();
+  const now = Date.now();
+  const created: SeatRecord[] = aiRounds.value.map((r, i) => ({
+    id: `${now}-${i}`,
+    exportedAt: now,
+    label: `第 ${i + 1} 次`,
+    rows: rows.value,
+    colors: groupCfgs.value.map((c) => c.color),
+    seatsPerRow: seatCount.value,
+    singleSeatName: singleSeatName.value,
+    grid: r.grid,
+  }));
+  if (!saveRecords([...created, ...list])) {
+    showToast("记录保存失败（本地存储可能已满）", "error");
+    return;
+  }
+  showToast(`已存入 ${created.length} 条记录`, "success");
 }
 
 /** 切换学生/老师视角：老师视角下讲台在学生后方（正下方） */
@@ -967,6 +1021,15 @@ const draftCapacity = computed(
       </div>
       </RoundSwitcher>
 
+      <details v-if="seatRounds.length > 1" class="mx-6 mb-4 rounded-lg border border-border bg-panel">
+        <summary class="cursor-pointer px-3 py-2 text-xs text-muted hover:text-title">
+          轮换统计（共 {{ seatRounds.length }} 次）
+        </summary>
+        <div class="p-3">
+          <FairnessTable :rows="seatFairnessRows" />
+        </div>
+      </details>
+
       <!-- 空态：无名单 -->
       <div
         v-if="nameCount === 0"
@@ -1311,6 +1374,12 @@ const draftCapacity = computed(
         <!-- 预览态：左座位图（老师视角下与主图一致整块旋转），右「为什么这么排」 -->
         <div v-else class="flex min-h-0 flex-1 gap-5 overflow-hidden p-5">
           <div class="min-w-0 shrink-0 overflow-auto">
+            <RoundSwitcher
+              :index="aiRoundIndex"
+              :total="aiRounds.length"
+              :warn="!!aiRound?.warnings.length"
+              @change="(i) => (aiRoundIndex = i)"
+            >
             <div class="flex flex-col items-start gap-4">
               <!-- 前排：讲台 + 单座，与主图同构（老师视角下整体沉到下方、左右翻转） -->
               <!-- 间距与下面组行的 gap-5 一致，单座正对第二组左列 -->
@@ -1362,6 +1431,7 @@ const draftCapacity = computed(
                 </div>
               </div>
             </div>
+            </RoundSwitcher>
             <div class="mt-4 text-xs text-muted">
               共 {{ aiPreviewNames }} 人排入网格；单座：{{ singleSeatName || "—" }}（不参与调整）— 座位可直接拖拽对调
             </div>
@@ -1372,7 +1442,10 @@ const draftCapacity = computed(
             <template v-if="aiBusy">
               <div class="flex items-center gap-1.5 text-xs font-medium text-title">
                 <LoaderCircle :size="12" class="animate-spin" />
-                模型思考中…
+                <template v-if="aiProgress.total > 1">
+                  第 {{ aiProgress.done }} / {{ aiProgress.total }} 次 · 模型思考中…
+                </template>
+                <template v-else>模型思考中…</template>
               </div>
               <div
                 ref="thinkBoxRef"
@@ -1405,6 +1478,23 @@ const draftCapacity = computed(
               >
                 {{ aiRound?.reason || "（模型未给出说明）" }}
               </div>
+              <div
+                v-if="aiRound?.warnings.length"
+                class="flex shrink-0 items-start gap-1.5 rounded-lg bg-red-50 p-2.5 text-xs text-red-600"
+              >
+                <TriangleAlert :size="14" class="mt-px shrink-0" />
+                <span>
+                  {{ aiRound.warnings.join("；") }}（已重试 2 次仍未能拆开，请手动调整）
+                </span>
+              </div>
+              <details class="shrink-0 rounded-lg border border-border bg-surface">
+                <summary class="cursor-pointer px-2.5 py-1.5 text-xs text-muted hover:text-title">
+                  轮换统计（共 {{ aiRounds.length }} 次）
+                </summary>
+                <div class="p-2.5">
+                  <FairnessTable :rows="fairnessRows" />
+                </div>
+              </details>
               <!-- 出结果后思考过程默认收起：原生 details，不用自己维护展开状态 -->
               <details
                 v-if="aiThinking"
@@ -1438,10 +1528,26 @@ const draftCapacity = computed(
             :disabled="aiBusy"
             class="h-16 min-w-0 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm leading-relaxed text-title outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
           ></textarea>
+          <div class="flex shrink-0 items-center gap-1 rounded-lg border border-border p-0.5 text-xs">
+            <button
+              class="rounded px-2 py-1"
+              :class="aiScope === 'round' ? 'bg-primary text-white' : 'text-text'"
+              @click="aiScope = 'round'"
+            >
+              当前这次
+            </button>
+            <button
+              class="rounded px-2 py-1"
+              :class="aiScope === 'all' ? 'bg-primary text-white' : 'text-text'"
+              @click="aiScope = 'all'"
+            >
+              整体重排
+            </button>
+          </div>
           <button
             class="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90 disabled:opacity-50"
             :disabled="aiBusy || !aiFollowUp.trim()"
-            @click="runFollowUp"
+            @click="onFollowUp"
           >
             <LoaderCircle v-if="aiBusy" :size="14" class="animate-spin" />
             {{ aiBusy ? "重排中…" : "重排" }}
@@ -1467,15 +1573,22 @@ const draftCapacity = computed(
           </template>
           <template v-else>
             <button
-              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
               :disabled="aiBusy"
               @click="resetAiRun"
             >
               返回修改
-            </button>            <button
-              class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90"
+            </button>
+            <button
+              class="rounded-lg border border-border px-4 py-1.5 text-xs text-text hover:border-primary hover:text-primary"
+              @click="saveRoundsToRecords"
+            >
+              全部存入记录
+            </button>
+            <button
+              class="rounded-lg bg-primary px-4 py-1.5 text-xs text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
               :disabled="aiBusy"
-              @click="applyAi"
+              @click="applyRounds"
             >
               应用到座位图
             </button>

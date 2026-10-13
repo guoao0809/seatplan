@@ -22,8 +22,8 @@ defineProps<{ rows: FairnessRow[] }>();
       </thead>
       <tbody>
         <tr
-          v-for="r in rows"
-          :key="r.name"
+          v-for="(r, i) in rows"
+          :key="`${i}-${r.name}`"
           class="border-b border-border last:border-0"
           :class="r.gaps.length ? 'bg-red-50' : ''"
         >
