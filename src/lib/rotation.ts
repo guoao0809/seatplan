@@ -10,14 +10,19 @@ export interface RosterStudent {
   note?: string;
 }
 
-/** 备注里「不能同桌」后面的名字段 */
-const NO_DESK_RE = /不能同桌\s*[:：]\s*([^;；\n]*)/g;
+/**
+ * 备注里「不能同桌」后面的名字段。遇到分号 / 换行 / 句末标点即认为该段结束——
+ * 只认分号和换行的话，「不能同桌:张三，李四。」会把句号吞进名字，
+ * 于是这条硬约束永远匹配不上，静默失效。
+ */
+const NO_DESK_RE = /不能同桌\s*[:：]\s*([^;；。！？!?\n]*)/g;
 
 export function parseNoDeskmate(note: string): string[] {
   const out: string[] = [];
   for (const m of note.matchAll(NO_DESK_RE)) {
     for (const raw of (m[1] ?? "").split(/[,，、;；\s]+/)) {
-      const name = raw.trim();
+      // 名字可能带着尾随标点，先剪掉再判断
+      const name = raw.trim().replace(/[。！？!?、，,;；.]+$/u, "").trim();
       if (name && !out.includes(name)) out.push(name);
     }
   }
@@ -25,12 +30,15 @@ export function parseNoDeskmate(note: string): string[] {
 }
 
 export function noDeskmatePairs(students: RosterStudent[]): [string, string][] {
+  // 只认名单里真实存在的人：备注若写成「不能同桌:李四，喜欢靠窗」，
+  // 按分隔符会切出「喜欢靠窗」这种散文片段，不对照名单就会留下一条永远匹配不上的幽灵约束
+  const known = new Set(students.map((s) => s.name.trim()).filter(Boolean));
   const pairs = new Map<string, [string, string]>();
   for (const s of students) {
     const me = s.name.trim();
     if (!me) continue;
     for (const other of parseNoDeskmate(s.note ?? "")) {
-      if (!other || other === me) continue; // 写自己没意义
+      if (other === me || !known.has(other)) continue; // 写自己、或不是本班学生 → 忽略
       // 字母序归一：单向声明即对称，同一对不重复入表
       const [a, b] = me < other ? [me, other] : [other, me];
       pairs.set(`${a}|${b}`, [a, b]);
@@ -40,7 +48,14 @@ export function noDeskmatePairs(students: RosterStudent[]): [string, string][] {
 }
 
 export function deskmateConflicts(grid: Grid, pairs: [string, string][]): [string, string][] {
-  const wanted = new Set(pairs.map(([a, b]) => `${a}|${b}`));
+  // 自己归一顺序，不依赖调用方先归一过
+  const wanted = new Set(
+    pairs.map(([x, y]) => {
+      const a = x.trim();
+      const b = y.trim();
+      return a < b ? `${a}|${b}` : `${b}|${a}`;
+    }),
+  );
   const hit: [string, string][] = [];
   for (const desk of deskPairsOf(grid)) {
     const names = desk.students.map((s) => s?.name?.trim() ?? "");
@@ -112,6 +127,24 @@ export function runRotationSelfCheck(): void {
   );
   const empty: Grid = [[[null, null]]];
   must(deskmateConflicts(empty, [["张三", "李四"]]).length === 0, "空位不该算冲突");
+
+  // 尾随标点 / 顿号 / 换行 / 散文混进名字段：都不能让硬约束凭空消失
+  must(
+    parseNoDeskmate("不能同桌:张三，李四。").join() === "张三,李四",
+    `句末句号不该进名字，实际 ${parseNoDeskmate("不能同桌:张三，李四。").join()}`,
+  );
+  must(parseNoDeskmate("不能同桌:张三、李四").join() === "张三,李四", "顿号应作分隔符");
+  must(parseNoDeskmate("不能同桌:张三\n别的备注").join() === "张三", "换行应终止名字段");
+  const proseNote = noDeskmatePairs([
+    { name: "张三", note: "不能同桌:李四，喜欢靠窗" },
+    { name: "李四" },
+  ]);
+  must(
+    proseNote.length === 1 && proseNote[0]!.join() === "张三,李四",
+    `散文「喜欢靠窗」不该成为幽灵约束，实际 ${JSON.stringify(proseNote)}`,
+  );
+  // 对外 API 不该要求调用方先归一顺序
+  must(deskmateConflicts(desk, [["李四", "张三"]]).length === 1, "对子顺序反过来也要能查到");
 }
 
 // 自检也可用 node 直接跑
