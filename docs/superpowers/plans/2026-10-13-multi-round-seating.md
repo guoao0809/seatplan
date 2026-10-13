@@ -1053,6 +1053,7 @@ async function runAi() {
   try {
     for (let i = 1; i <= total; i++) {
       aiProgress.value = { done: i, total };
+      aiThinking.value = ""; // 每轮从头攒思考过程，否则 8 轮的思考会连成一大坨
       let hint = "";
       let round: AiRound | null = null;
 
@@ -1062,10 +1063,16 @@ async function runAi() {
           grid: base,
           labels,
           singleSeatName: singleSeatName.value,
-          history: aiRounds.value.slice(-3).map((r) => r.grid),
+          // payload 的 history 约定是「最新在前」，与既有传记录的顺序一致
+          history: aiRounds.value.slice(-3).reverse().map((r) => r.grid),
           instruction: roundInstruction(i, total, rule, hint),
           students: roster.value,
-          roundStats: roundStatsOf([...aiRounds.value.map((r) => r.grid), base], roster.value),
+          // 第 1 轮时 aiRounds 还空着，此时基准是主页那张图；第 2 轮起 base 已经躺在 aiRounds 里了，
+          // 再加一次就会把上一轮算两遍、计分表翻倍
+          roundStats: roundStatsOf(
+            aiRounds.value.length ? aiRounds.value.map((r) => r.grid) : [base],
+            roster.value,
+          ),
         });
 
         let text = "";
@@ -1103,10 +1110,9 @@ async function runAi() {
         hint = `上一版仍把「${conflicts[0]![0]}」和「${conflicts[0]![1]}」排成了同桌，这次必须把他们拆开。`;
       }
 
-      if (!round) return;
+      // 内层循环只有两种出口：round 已赋值，或已直接 return——所以这里不必再判空
       aiRounds.value = [...aiRounds.value, round];
       base = round.grid;
-      if (i === 1) aiRoundIndex.value = 0;
     }
   } catch (e) {
     if (id !== aiReqId) return;
@@ -1129,6 +1135,15 @@ async function runAi() {
 const roundsToGenerate = ref(8);
 ```
 
+```ts
+/** 一次生成的次数，1~20 */
+const roundsToGenerate = ref(8);
+/** 实际会跑的次数（钳到 1~20）：按钮文案与耗时预估都用它，免得填 999 显示 999 却只跑 20 */
+const roundsClamped = computed(() =>
+  Math.min(20, Math.max(1, Math.round(roundsToGenerate.value) || 1)),
+);
+```
+
 模板：AI 输入态的提示词 textarea 下面加一行：
 
 ```vue
@@ -1144,7 +1159,7 @@ const roundsToGenerate = ref(8);
             />
             <span class="text-xs text-muted">
               1~20 次，逐次串行生成；预计 ≈
-              {{ Math.max(1, roundsToGenerate || 1) }} × 每轮耗时（关推理 2~4 秒，
+              {{ roundsClamped }} × 每轮耗时（关推理 2~4 秒，
               开推理 50~80 秒）
             </span>
           </div>
@@ -1153,7 +1168,7 @@ const roundsToGenerate = ref(8);
 并把排座按钮的文案改成：
 
 ```vue
-            {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${Math.max(1, roundsToGenerate || 1)} 次）` }}
+            {{ aiBusy ? `排座中（第 ${aiProgress.done}/${aiProgress.total} 次）…` : `开始排座（${roundsClamped} 次）` }}
 ```
 
 输入态那个「模型思考中…」的标题也带上进度（生成中右栏会被 `v-if="aiBusy"` 占住）：
@@ -1172,6 +1187,22 @@ const roundsToGenerate = ref(8);
 
 Run: `cd /d/wok/worknotes/seatplan && grep -n "aiPreview\b\|aiReason\|aiSummary" src/views/SeatView.vue`
 把每一处改成当前轮（例如 `aiPreview` → `aiRound?.grid`、`aiReason` → `aiRound?.reason`、`aiSummary` → `aiRound?.summary`），`resetAiRun()` 里改成清 `aiRounds = []` / `aiRoundIndex = 0` / `aiProgress`。
+
+**`resetAiRun()` 还要作废在途的那条链，并让界面脱离「排座中」**——这是本任务引入的新风险：第 1 轮生成完弹窗就切到预览态，而第 2..N 轮还在跑（`aiBusy` 为 true）。此时若从别的出口调用 `resetAiRun()`（预览态的「返回修改」就是），链不会被作废，它会继续往刚清空的 `aiRounds` 里写。函数开头补两行：
+
+```ts
+function resetAiRun() {
+  aiReqId++; // 作废在途的链：否则它跑完会继续往刚清空的 aiRounds 里写
+  aiBusy.value = false; // 链已作废，界面不能继续卡在「排座中」
+  aiRounds.value = [];
+  aiRoundIndex.value = 0;
+  aiProgress.value = { done: 0, total: 0 };
+  aiThinking.value = "";
+  // …其余既有字段保持不动
+}
+```
+
+同时给预览态的**「返回修改」与「应用到座位图」两个按钮加 `:disabled="aiBusy"`**：光靠作废是"点了会有后果但不出错"，禁用才是"链跑到一半别让人以为能退出"。Task 9 把「应用到座位图」换成 `applyRounds()` 时，这个 `:disabled` 要保留。
 注意模板里 `v-if="aiPreview"` 的预览态判断要改成 `v-if="aiRounds.length > 0"`。
 
 - [ ] **Step 6: 手工验证**
